@@ -7,7 +7,7 @@
         android:id="@+id/terminal_toolbar_back_button"
         android:layout_width="wrap_content"
         android:layout_height="match_parent"
-        android:text="←"
+        android:text="❮"
         tools:ignore="HardcodedText" />
     <EditText
         android:id="@+id/terminal_toolbar_text_input"
