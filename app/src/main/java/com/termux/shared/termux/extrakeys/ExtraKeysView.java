@@ -108,7 +108,7 @@ public final class ExtraKeysView extends GridLayout {
     /** Defines the default value for {@link #mButtonTextColor} */
     public static final int DEFAULT_BUTTON_TEXT_COLOR = 0xFFFFFFFF;
     /** Defines the default value for {@link #mButtonActiveTextColor} */
-    public static final int DEFAULT_BUTTON_ACTIVE_TEXT_COLOR = 0xFF80DEEA;
+    public static final int DEFAULT_BUTTON_ACTIVE_TEXT_COLOR = 0xFF98CBFF;
     /** Defines the default value for {@link #mButtonBackgroundColor} */
     public static final int DEFAULT_BUTTON_BACKGROUND_COLOR = 0x00000000;
     /** Defines the default value for {@link #mButtonActiveBackgroundColor} */
@@ -330,7 +330,7 @@ public final class ExtraKeysView extends GridLayout {
                 button.setOnTouchListener((view, event) -> {
                     switch (event.getAction()) {
                         case MotionEvent.ACTION_DOWN:
-                            view.setBackgroundColor(mButtonActiveBackgroundColor);
+                            view.setBackgroundColor(0x50FFFFFF);
                             // Start long press scheduled executors which will be stopped in next MotionEvent
                             startScheduledExecutors(view, buttonInfo, button);
                             return true;
@@ -340,23 +340,23 @@ public final class ExtraKeysView extends GridLayout {
                                 // Show popup on swipe up
                                 if (mPopupWindow == null && event.getY() < 0) {
                                     stopScheduledExecutors();
-                                    view.setBackgroundColor(mButtonBackgroundColor);
+                                    view.setBackgroundColor(0x80000000);
                                     showPopup(view, buttonInfo.popup);
                                 }
                                 if (mPopupWindow != null && event.getY() > 0) {
-                                    view.setBackgroundColor(mButtonActiveBackgroundColor);
+                                    view.setBackgroundColor(0x50FFFFFF);
                                     dismissPopup();
                                 }
                             }
                             return true;
 
                         case MotionEvent.ACTION_CANCEL:
-                            view.setBackgroundColor(mButtonBackgroundColor);
+                            view.setBackgroundColor(0x80000000);
                             stopScheduledExecutors();
                             return true;
 
                         case MotionEvent.ACTION_UP:
-                            view.setBackgroundColor(mButtonBackgroundColor);
+                            view.setBackgroundColor(0x80000000);
                             stopScheduledExecutors();
                             // If ACTION_UP up was not from a repetitive key or was with a key with a popup button
                             if (mLongPressCount == 0 || mPopupWindow != null) {
@@ -503,7 +503,7 @@ public final class ExtraKeysView extends GridLayout {
         button.setMinimumHeight(0);
         button.setWidth(width);
         button.setHeight(height);
-        button.setBackgroundColor(mButtonActiveBackgroundColor);
+        button.setBackgroundColor(0x80000000);
         mPopupWindow = new PopupWindow(this);
         mPopupWindow.setWidth(LayoutParams.WRAP_CONTENT);
         mPopupWindow.setHeight(LayoutParams.WRAP_CONTENT);
