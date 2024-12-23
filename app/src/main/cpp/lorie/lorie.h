@@ -1,13 +1,19 @@
 #pragma once
 
+#include <android/hardware_buffer.h>
+#include <android/choreographer.h>
+#include <android/log.h>
+
+#include <X11/Xdefs.h>
 #include <X11/keysymdef.h>
 #include <jni.h>
+#include <screenint.h>
+#include <sys/socket.h>
 #include "linux/input-event-codes.h"
 
 void lorieSetVM(JavaVM* vm);
-Bool lorieChangeScreenName(ClientPtr pClient, void *closure);
 Bool lorieChangeWindow(ClientPtr pClient, void *closure);
-void lorieConfigureNotify(int width, int height, int framerate);
+void lorieConfigureNotify(int width, int height, int framerate, size_t name_size, char* name);
 void lorieEnableClipboardSync(Bool enable);
 void lorieSendClipboardData(const char* data);
 void lorieInitClipboard(void);
@@ -16,6 +22,86 @@ void lorieHandleClipboardAnnounce(void);
 void lorieHandleClipboardData(const char* data);
 Bool lorieInitDri3(ScreenPtr pScreen);
 void lorieSetStylusEnabled(Bool enabled);
+void lorieTriggerWorkingQueue(void);
+void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
+void lorieActivityConnected(void);
+void lorieSendSharedServerState(int memfd);
+void lorieSendRootWindowBuffer(AHardwareBuffer* buffer);
+void lorieRequestRender(void);
+
+typedef enum {
+    EVENT_UNKNOWN,
+    EVENT_SHARED_SERVER_STATE,
+    EVENT_SHARED_ROOT_WINDOW_BUFFER,
+    EVENT_REQUEST_RENDER,
+    EVENT_SCREEN_SIZE,
+    EVENT_TOUCH,
+    EVENT_MOUSE,
+    EVENT_KEY,
+    EVENT_STYLUS,
+    EVENT_STYLUS_ENABLE,
+    EVENT_UNICODE,
+    EVENT_CLIPBOARD_ENABLE,
+    EVENT_CLIPBOARD_ANNOUNCE,
+    EVENT_CLIPBOARD_REQUEST,
+    EVENT_CLIPBOARD_SEND,
+} eventType;
+
+typedef union {
+    uint8_t type;
+    struct {
+        uint8_t t;
+        uint16_t width, height, framerate;
+        size_t name_size;
+        char *name;
+    } screenSize;
+    struct {
+        uint8_t t;
+        uint16_t type, id, x, y;
+    } touch;
+    struct {
+        uint8_t t;
+        float x, y;
+        uint8_t detail, down, relative;
+    } mouse;
+    struct {
+        uint8_t t;
+        uint16_t key;
+        uint8_t state;
+    } key;
+    struct {
+        uint8_t t;
+        float x, y;
+        uint16_t pressure;
+        int8_t tilt_x, tilt_y;
+        int16_t orientation;
+        uint8_t buttons, eraser, mouse;
+    } stylus;
+    struct {
+        uint8_t t, enable;
+    } stylusEnable;
+    struct {
+        uint8_t t;
+        uint32_t code;
+    } unicode;
+    struct {
+        uint8_t t;
+        uint8_t enable;
+    } clipboardEnable;
+    struct {
+        uint8_t t;
+        uint32_t count;
+    } clipboardSend;
+} lorieEvent;
+
+struct lorie_shared_server_state {
+    pthread_mutex_t lock; // initialized at X server side.
+    struct {
+        uint32_t x, y, xhot, yhot, width, height;
+        uint32_t bits[512*512]; // 1 megabyte should be enough for any cursor up to 512x512
+        uint8_t updated;
+    } cursor;
+};
 
 static int android_to_linux_keycode[304] = {
         [ 4   /* ANDROID_KEYCODE_BACK */] = KEY_ESC,
@@ -161,3 +247,63 @@ static int android_to_linux_keycode[304] = {
         [ 208  /* ANDROID_KEYCODE_CALENDAR */] = KEY_CALENDAR,
         [ 210  /* ANDROID_KEYCODE_CALCULATOR */] = KEY_CALC,
 };
+
+__always_inline static inline int ancil_send_fd(int sock, int fd)
+{
+    char nothing = '!';
+    struct iovec nothing_ptr = { .iov_base = &nothing, .iov_len = 1 };
+
+    struct {
+        struct cmsghdr align;
+        int fd[1];
+    } ancillary_data_buffer;
+
+    struct msghdr message_header = {
+            .msg_name = NULL,
+            .msg_namelen = 0,
+            .msg_iov = &nothing_ptr,
+            .msg_iovlen = 1,
+            .msg_flags = 0,
+            .msg_control = &ancillary_data_buffer,
+            .msg_controllen = sizeof(struct cmsghdr) + sizeof(int)
+    };
+
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&message_header);
+    cmsg->cmsg_len = message_header.msg_controllen; // sizeof(int);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    ((int*) CMSG_DATA(cmsg))[0] = fd;
+
+    return sendmsg(sock, &message_header, 0) >= 0 ? 0 : -1;
+}
+
+__always_inline static inline int ancil_recv_fd(int sock)
+{
+    char nothing = '!';
+    struct iovec nothing_ptr = { .iov_base = &nothing, .iov_len = 1 };
+
+    struct {
+        struct cmsghdr align;
+        int fd[1];
+    } ancillary_data_buffer;
+
+    struct msghdr message_header = {
+            .msg_name = NULL,
+            .msg_namelen = 0,
+            .msg_iov = &nothing_ptr,
+            .msg_iovlen = 1,
+            .msg_flags = 0,
+            .msg_control = &ancillary_data_buffer,
+            .msg_controllen = sizeof(struct cmsghdr) + sizeof(int)
+    };
+
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&message_header);
+    cmsg->cmsg_len = message_header.msg_controllen;
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    ((int*) CMSG_DATA(cmsg))[0] = -1;
+
+    if (recvmsg(sock, &message_header, 0) < 0) return -1;
+
+    return ((int*) CMSG_DATA(cmsg))[0];
+}

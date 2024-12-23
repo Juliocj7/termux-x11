@@ -41,7 +41,7 @@ from The Open Group.
 #endif
 
 #include <stdio.h>
-#include <sys/timerfd.h>
+#include <sys/eventfd.h>
 #include <sys/errno.h>
 #include <libxcvt/libxcvt.h>
 #include <X11/X.h>
@@ -57,6 +57,7 @@ from The Open Group.
 #include <dri3.h>
 #include <sys/mman.h>
 #include <busfault.h>
+#include <linux/ashmem.h>
 #include "scrnintstr.h"
 #include "servermd.h"
 #include "fb.h"
@@ -88,7 +89,17 @@ from The Open Group.
 
 extern DeviceIntPtr lorieMouse, lorieKeyboard;
 
+#define lorieGCPriv(pGC) LorieGCPrivPtr pGCPriv = dixLookupPrivate(&(pGC)->devPrivates, &lorieGCPrivateKey)
+static DevPrivateKeyRec lorieGCPrivateKey;
 typedef struct {
+    const GCOps *ops;
+    const GCFuncs *funcs;
+} LorieGCPrivRec, *LorieGCPrivPtr;
+static Bool lorieCreateGC(GCPtr pGC);
+
+typedef struct {
+    bool ready;
+    CreateGCProcPtr CreateGC;
     CloseScreenProcPtr CloseScreen;
     CreateScreenResourcesProcPtr CreateScreenResources;
 
@@ -97,25 +108,86 @@ typedef struct {
     OsTimerPtr fpsTimer;
 
     Bool cursorMoved;
-    int timerFd;
+    int eventFd, stateFd;
 
+    struct lorie_shared_server_state* state;
     struct {
         AHardwareBuffer* buffer;
         Bool locked;
         Bool legacyDrawing;
         uint8_t flip;
         uint32_t width, height;
+        char name[1024];
+        uint32_t framerate;
     } root;
 
     JavaVM* vm;
     JNIEnv* env;
     Bool dri3;
-} lorieScreenInfo, *lorieScreenInfoPtr;
+} lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
-static lorieScreenInfo lorieScreen = { .root.width = 1280, .root.height = 1024, .dri3 = TRUE };
-static lorieScreenInfoPtr pvfb = &lorieScreen;
+static lorieScreenInfo lorieScreen = {
+        .root.width = 1280,
+        .root.height = 1024,
+        .root.framerate = 30,
+        .root.name = "screen",
+        .dri3 = TRUE,
+}, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
+
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "UnreachableCallsOfFunction"
+static int create_shmem_region(char const* name, size_t size)
+{
+    int fd = memfd_create("Xlorie", MFD_CLOEXEC|MFD_ALLOW_SEALING);
+    if (fd) {
+        ftruncate (fd, size);
+        return fd;
+    }
+
+    fd = open("/dev/ashmem", O_RDWR);
+    if (fd < 0)
+        return fd;
+
+    char name_buffer[ASHMEM_NAME_LEN] = {0};
+    strncpy(name_buffer, name, sizeof(name_buffer));
+    name_buffer[sizeof(name_buffer)-1] = 0;
+
+    int ret = ioctl(fd, ASHMEM_SET_NAME, name_buffer);
+    if (ret < 0) goto error;
+
+    ret = ioctl(fd, ASHMEM_SET_SIZE, size);
+    if (ret < 0) goto error;
+
+    return fd;
+    error:
+    close(fd);
+    return ret;
+}
+#pragma clang diagnostic pop
+
+__attribute((constructor())) static void initSharedServerState() {
+    pthread_mutexattr_t mutex_attr;
+    if (-1 == (lorieScreen.stateFd = create_shmem_region("xserver", sizeof(*lorieScreen.state)))) {
+        dprintf(2, "FATAL: Failed to allocate server state.\n");
+        _exit(1);
+    }
+
+    if (!(lorieScreen.state = mmap(NULL, sizeof(*lorieScreen.state), PROT_READ|PROT_WRITE, MAP_SHARED, lorieScreen.stateFd, 0))) {
+        dprintf(2, "FATAL: Failed to map server state.\n");
+        _exit(1);
+    }
+
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&lorieScreen.state->lock, &mutex_attr);
+}
+
+void lorieActivityConnected(void) {
+    lorieSendSharedServerState(pvfb->stateFd);
+    lorieSendRootWindowBuffer(pvfb->root.buffer);
+}
 
 static Bool TrueNoop() { return TRUE; }
 static Bool FalseNoop() { return FALSE; }
@@ -260,12 +332,23 @@ static RRModePtr lorieCvt(int width, int height, int framerate) {
     return mode;
 }
 
-static void lorieMoveCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int y) {
-    renderer_set_cursor_coordinates(x, y);
-    pvfb->cursorMoved = TRUE;
+static Bool resetRootCursor(unused ClientPtr pClient, unused void *closure) {
+    CursorVisible = TRUE;
+    pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, NullCursor);
+    pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, rootCursor);
+    return TRUE;
 }
 
-static void lorieConvertCursor(CursorPtr pCurs, CARD32 *data) {
+static void lorieMoveCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int y) {
+    pthread_mutex_lock(&pvfb->state->lock);
+    pvfb->state->cursor.x = x;
+    pvfb->state->cursor.y = y;
+    renderer_set_cursor_coordinates(x, y);
+    pvfb->cursorMoved = TRUE;
+    pthread_mutex_unlock(&pvfb->state->lock);
+}
+
+static void lorieConvertCursor(CursorPtr pCurs, uint32_t *data) {
     CursorBitsPtr bits = pCurs->bits;
     if (bits->argb) {
         for (int i = 0; i < bits->width * bits->height; i++) {
@@ -274,7 +357,7 @@ static void lorieConvertCursor(CursorPtr pCurs, CARD32 *data) {
             data[i] = (p & 0xFF000000) | ((p & 0x00FF0000) >> 16) | (p & 0x0000FF00) | ((p & 0x000000FF) << 16);
         }
     } else {
-        CARD32 d, fg, bg, *p;
+        uint32_t d, fg, bg, *p;
         int x, y, stride, i, bit;
 
         p = data;
@@ -294,13 +377,27 @@ static void lorieConvertCursor(CursorPtr pCurs, CARD32 *data) {
 
 static void lorieSetCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, CursorPtr pCurs, int x0, int y0) {
     CursorBitsPtr bits = pCurs ? pCurs->bits : NULL;
-    if (pCurs && bits) {
-        CARD32 data[bits->width * bits->height * 4];
+    if (pCurs && (pCurs->bits->width >= 512 || pCurs->bits->height >= 512)) {
+        // We do not have enough memory allocated for such a big cursor, let's display default "X" cursor
+        QueueWorkProc(resetRootCursor, NULL, NULL);
+        return;
+    }
 
-        lorieConvertCursor(pCurs, data);
-        renderer_update_cursor(bits->width, bits->height, bits->xhot, bits->yhot, data);
-    } else
+    pthread_mutex_lock(&pvfb->state->lock);
+    if (pCurs && bits) {
+        pvfb->state->cursor.xhot = bits->xhot;
+        pvfb->state->cursor.yhot = bits->yhot;
+        pvfb->state->cursor.width = bits->width;
+        pvfb->state->cursor.height = bits->height;
+        lorieConvertCursor(pCurs, pvfb->state->cursor.bits);
+        renderer_update_cursor(bits->width, bits->height, bits->xhot, bits->yhot, pvfb->state->cursor.bits);
+    } else {
+        pvfb->state->cursor.xhot = pvfb->state->cursor.yhot = 0;
+        pvfb->state->cursor.width = pvfb->state->cursor.height = 0;
         renderer_update_cursor(0, 0, 0, 0, NULL);
+    }
+    pvfb->state->cursor.updated = true;
+    pthread_mutex_unlock(&pvfb->state->lock);
 
     if (x0 >= 0 && y0 >= 0)
         lorieMoveCursor(NULL, NULL, x0, y0);
@@ -367,6 +464,7 @@ static void lorieUpdateBuffer(void) {
         pScreenPtr->ModifyPixmapHeader(pScreenPtr->devPrivate, d0.width, d0.height, 32, 32, d0.stride * 4, data0);
 
         renderer_set_buffer(pvfb->env, new);
+        lorieSendRootWindowBuffer(pvfb->root.buffer);
     }
 
     if (old) {
@@ -434,21 +532,23 @@ static inline Bool loriePixmapLock(PixmapPtr pixmap) {
     return pvfb->root.locked;
 }
 
-static void lorieTimerCallback(int fd, unused int r, void *arg) {
-    char dummy[8];
-    read(fd, dummy, 8);
+static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (renderer_should_redraw() && RegionNotEmpty(DamageRegion(pvfb->damage))) {
         int redrawn = FALSE;
-        ScreenPtr pScreen = (ScreenPtr) arg;
 
-        loriePixmapUnlock(pScreen->GetScreenPixmap(pScreen));
+        loriePixmapUnlock(pScreenPtr->devPrivate);
         redrawn = renderer_redraw(pvfb->env, pvfb->root.flip);
-        if (loriePixmapLock(pScreen->GetScreenPixmap(pScreen)) && redrawn)
+        if (loriePixmapLock(pScreenPtr->devPrivate) && redrawn)
             DamageEmpty(pvfb->damage);
-    } else if (pvfb->cursorMoved)
+        if (redrawn)
+            lorieRequestRender();
+    } else if (pvfb->cursorMoved) {
         renderer_redraw(pvfb->env, pvfb->root.flip);
+        lorieRequestRender();
+    }
 
     pvfb->cursorMoved = FALSE;
+    return TRUE;
 }
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
@@ -472,13 +572,19 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
 
     DamageRegister(&(*pScreen->GetScreenPixmap)(pScreen)->drawable, pvfb->damage);
     pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
+
+    pthread_mutex_lock(&pvfb->state->lock);
     lorieUpdateBuffer();
+    pthread_mutex_unlock(&pvfb->state->lock);
+
+    pvfb->ready = true;
 
     return TRUE;
 }
 
 static Bool
 lorieCloseScreen(ScreenPtr pScreen) {
+    pvfb->ready = false;
     unwrap(pvfb, pScreen, CloseScreen)
     // No need to call fbDestroyPixmap since AllocatePixmap sets pixmap as PRIVATE_SCREEN so it is destroyed automatically.
     return pScreen->CloseScreen(pScreen);
@@ -492,7 +598,10 @@ lorieRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height, unused CARD
     pvfb->root.height = pScreen->height = height;
     pScreen->mmWidth = ((double) (width)) * 25.4 / monitorResolution;
     pScreen->mmHeight = ((double) (height)) * 25.4 / monitorResolution;
+
+    pthread_mutex_lock(&pvfb->state->lock);
     lorieUpdateBuffer();
+    pthread_mutex_unlock(&pvfb->state->lock);
 
     pScreen->ResizeWindow(pScreen->root, 0, 0, width, height, NULL);
     DamageEmpty(pvfb->damage);
@@ -508,7 +617,7 @@ lorieRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height, unused CARD
 static Bool
 lorieRRCrtcSet(unused ScreenPtr pScreen, RRCrtcPtr crtc, RRModePtr mode, int x, int y,
                Rotation rotation, int numOutput, RROutputPtr *outputs) {
-  return (crtc && mode) ? RRCrtcNotify(crtc, mode, x, y, rotation, NULL, numOutput, outputs) : FALSE;
+    return (crtc && mode) ? RRCrtcNotify(crtc, mode, x, y, rotation, NULL, numOutput, outputs) : FALSE;
 }
 
 static Bool
@@ -524,8 +633,6 @@ lorieRandRInit(ScreenPtr pScreen) {
     RRCrtcPtr crtc;
     RRModePtr mode;
 
-    char screenName[1024] = "screen";
-
     if (!RRScreenInit(pScreen))
        return FALSE;
 
@@ -537,10 +644,10 @@ lorieRandRInit(ScreenPtr pScreen) {
     RRScreenSetSizeRange(pScreen, 1, 1, 32767, 32767);
 
     if (FALSE
-        || !(mode = lorieCvt(pScreen->width, pScreen->height, 30))
+        || !(mode = lorieCvt(pScreen->width, pScreen->height, pvfb->root.framerate))
         || !(crtc = RRCrtcCreate(pScreen, NULL))
         || !RRCrtcGammaSetSize(crtc, 256)
-        || !(output = RROutputCreate(pScreen, screenName, sizeof(screenName), NULL))
+        || !(output = RROutputCreate(pScreen, pvfb->root.name, sizeof(pvfb->root.name), NULL))
         || (output->nameLength = strlen(output->name), FalseNoop())
         || !RROutputSetClones(output, NULL, 0)
         || !RROutputSetModes(output, &mode, 1, 0)
@@ -551,32 +658,41 @@ lorieRandRInit(ScreenPtr pScreen) {
     return TRUE;
 }
 
-static Bool resetRootCursor(unused ClientPtr pClient, unused void *closure) {
-    CursorVisible = TRUE;
-    pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, NullCursor);
-    pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, rootCursor);
-    return TRUE;
+void lorieTriggerWorkingQueue(void) {
+    eventfd_write(pvfb->eventFd, 1);
+}
+
+static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused *data) {
+    // Nothing to do here. It is needed to finish ospoll_wait.
+    eventfd_t dummy;
+    eventfd_read(fd, &dummy);
+}
+
+void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+    AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
+    if (pvfb->ready) {
+        QueueWorkProc(lorieRedraw, NULL, NULL);
+        lorieTriggerWorkingQueue();
+    }
 }
 
 static Bool
 lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {
-    static int timerFd = -1;
+    static int eventFd = -1;
     pScreenPtr = pScreen;
 
-    if (timerFd == -1) {
-        struct itimerspec spec = {0};
-        timerFd = timerfd_create(CLOCK_MONOTONIC,  0);
-        timerfd_settime(timerFd, 0, &spec, NULL);
-    }
+    if (eventFd == -1)
+        eventFd = eventfd(0, EFD_CLOEXEC);
 
-    pvfb->timerFd = timerFd;
-    SetNotifyFd(timerFd, lorieTimerCallback, X_NOTIFY_READ, pScreen);
+    pvfb->eventFd = eventFd;
+    SetNotifyFd(eventFd, lorieWorkingQueueCallback, X_NOTIFY_READ, NULL);
 
     miSetZeroLineBias(pScreen, 0);
     pScreen->blackPixel = 0;
     pScreen->whitePixel = 1;
 
     if (FALSE
+          || !dixRegisterPrivateKey(&lorieGCPrivateKey, PRIVATE_GC, sizeof(LorieGCPrivRec))
           || !miSetVisualTypesAndMasks(24, ((1 << TrueColor) | (1 << DirectColor)), 8, TrueColor, 0xFF0000, 0x00FF00, 0x0000FF)
           || !miSetPixmapDepths()
           || !fbScreenInit(pScreen, NULL, pvfb->root.width, pvfb->root.height, monitorResolution, monitorResolution, 0, 32)
@@ -589,6 +705,7 @@ lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {
 
     wrap(pvfb, pScreen, CreateScreenResources, lorieCreateScreenResources)
     wrap(pvfb, pScreen, CloseScreen, lorieCloseScreen)
+    wrap(pvfb, pScreen, CreateGC, lorieCreateGC)
 
     QueueWorkProc(resetRootCursor, NULL, NULL);
     ShmRegisterFbFuncs(pScreen);
@@ -612,16 +729,6 @@ CursorForDevice(DeviceIntPtr pDev) {
     return NULL;
 }
 
-Bool lorieChangeScreenName(unused ClientPtr pClient, void *closure) {
-    RROutputPtr output = RRFirstOutput(pScreenPtr);
-    memset(output->name, 0, 1024);
-    strncpy(output->name, closure, 1024);
-    output->name[1023] = '\0';
-    output->nameLength = strlen(output->name);
-    free(closure);
-    return TRUE;
-}
-
 Bool lorieChangeWindow(unused ClientPtr pClient, void *closure) {
     jobject surface = (jobject) closure;
     renderer_set_window(pvfb->env, surface, pvfb->root.buffer);
@@ -635,13 +742,25 @@ Bool lorieChangeWindow(unused ClientPtr pClient, void *closure) {
     return TRUE;
 }
 
-void lorieConfigureNotify(int width, int height, int framerate) {
+void lorieConfigureNotify(int width, int height, int framerate, size_t name_size, char* name) {
     ScreenPtr pScreen = pScreenPtr;
     RROutputPtr output = RRFirstOutput(pScreen);
+    framerate = framerate ? framerate : 0;
+
+    if (output && name) {
+        // We should save this name in pvfb to make sure the name will be restored in the case if the server is being reset.
+        memset(pvfb->root.name, 0, 1024);
+        memset(output->name, 0, 1024);
+        strncpy(pvfb->root.name, name, name_size < 1024 ? name_size : 1024);
+        strncpy(output->name, name, name_size < 1024 ? name_size : 1024);
+        output->name[1023] = '\0';
+        output->nameLength = strlen(output->name);
+    }
 
     if (output && width && height && (pScreen->width != width || pScreen->height != height)) {
         CARD32 mmWidth, mmHeight;
         RRModePtr mode = lorieCvt(width, height, framerate);
+        pvfb->root.framerate = framerate;
         mmWidth = ((double) (mode->mode.width)) * 25.4 / monitorResolution;
         mmHeight = ((double) (mode->mode.width)) * 25.4 / monitorResolution;
         RROutputSetModes(output, &mode, 1, 0);
@@ -650,11 +769,7 @@ void lorieConfigureNotify(int width, int height, int framerate) {
     }
 
     if (framerate > 0) {
-        long nsecs = 1000 * 1000 * 1000 / framerate;
-        struct itimerspec spec = { { 0, nsecs }, { 0, nsecs } };
-        timerfd_settime(lorieScreen.timerFd, 0, &spec, NULL);
-        log(VERBOSE, "New framerate is %d", framerate);
-
+        log(VERBOSE, "New reported framerate is %d", framerate);
         FakeScreenFps = framerate;
         present_fake_screen_init(pScreen);
     }
@@ -693,6 +808,282 @@ InitOutput(ScreenInfo * screen_info, int argc, char **argv) {
 void lorieSetVM(JavaVM* vm) {
     pvfb->vm = vm;
     (*vm)->AttachCurrentThread(vm, &pvfb->env, NULL);
+}
+
+#define LORIE_GC_OP_PROLOGUE(pGC) \
+    lorieGCPriv(pGC);  \
+    const GCFuncs *oldFuncs = pGC->funcs; \
+    const GCOps *oldOps = pGC->ops; \
+    unwrap(pGCPriv, pGC, funcs);  \
+    unwrap(pGCPriv, pGC, ops); \
+
+#define LORIE_GC_OP_EPILOGUE(pGC) \
+    wrap(pGCPriv, pGC, funcs, oldFuncs); \
+    wrap(pGCPriv, pGC, ops, oldOps)
+
+#define LORIE_GC_FUNC_PROLOGUE(pGC) \
+    lorieGCPriv(pGC); \
+    unwrap(pGCPriv, pGC, funcs); \
+    if (pGCPriv->ops) unwrap(pGCPriv, pGC, ops)
+
+#define LORIE_GC_FUNC_EPILOGUE(pGC) \
+    wrap(pGCPriv, pGC, funcs, &lorieGCFuncs);  \
+    if (pGCPriv->ops) wrap(pGCPriv, pGC, ops, &lorieGCOps)
+
+static const GCOps lorieGCOps;
+static const GCFuncs lorieGCFuncs;
+
+static void lorieValidateGC(GCPtr pGC, unsigned long stateChanges, DrawablePtr pDrawable) {
+    LORIE_GC_FUNC_PROLOGUE(pGC)
+    (*pGC->funcs->ValidateGC) (pGC, stateChanges, pDrawable);
+    LORIE_GC_FUNC_EPILOGUE(pGC)
+}
+
+static void lorieChangeGC(GCPtr pGC, unsigned long mask) {
+    LORIE_GC_FUNC_PROLOGUE(pGC)
+    (*pGC->funcs->ChangeGC) (pGC, mask);
+    LORIE_GC_FUNC_EPILOGUE(pGC)
+}
+
+static void lorieCopyGC(GCPtr pGCSrc, unsigned long mask, GCPtr pGCDst) {
+    LORIE_GC_FUNC_PROLOGUE(pGCSrc)
+    (*pGCSrc->funcs->CopyGC) (pGCSrc, mask, pGCDst);
+    LORIE_GC_FUNC_EPILOGUE(pGCSrc)
+}
+
+static void lorieDestroyGC(GCPtr pGC) {
+    LORIE_GC_FUNC_PROLOGUE(pGC)
+    (*pGC->funcs->DestroyGC) (pGC);
+    LORIE_GC_FUNC_EPILOGUE(pGC)
+}
+
+static void lorieChangeClip(GCPtr pGC, int type, void *pvalue, int nrects) {
+    LORIE_GC_FUNC_PROLOGUE(pGC)
+    (*pGC->funcs->ChangeClip) (pGC, type, pvalue, nrects);
+    LORIE_GC_FUNC_EPILOGUE(pGC)
+}
+
+static void lorieDestroyClip(GCPtr pGC) {
+    LORIE_GC_FUNC_PROLOGUE(pGC)
+    (*pGC->funcs->DestroyClip) (pGC);
+    LORIE_GC_FUNC_EPILOGUE(pGC)
+}
+
+static void lorieCopyClip(GCPtr pgcDst, GCPtr pgcSrc) {
+    LORIE_GC_FUNC_PROLOGUE(pgcDst)
+    (*pgcDst->funcs->CopyClip) (pgcDst, pgcSrc);
+    LORIE_GC_FUNC_EPILOGUE(pgcDst)
+}
+
+static const GCFuncs lorieGCFuncs = {
+        lorieValidateGC, lorieChangeGC, lorieCopyGC, lorieDestroyGC,
+        lorieChangeClip, lorieDestroyClip, lorieCopyClip
+};
+#define LOCK_DRAWABLE(a) if (a == pScreenPtr->devPrivate || (a && a->type == DRAWABLE_WINDOW)) pthread_mutex_lock(&pvfb->state->lock)
+#define UNLOCK_DRAWABLE(a) if (a == pScreenPtr->devPrivate || (a && a->type == DRAWABLE_WINDOW)) pthread_mutex_unlock(&pvfb->state->lock)
+
+static void lorieFillSpans(DrawablePtr pDrawable, GCPtr pGC, int nInit, DDXPointPtr pptInit, int * pwidthInit, int fSorted) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->FillSpans) (pDrawable, pGC, nInit, pptInit, pwidthInit, fSorted);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void lorieSetSpans(DrawablePtr pDrawable, GCPtr pGC, char * psrc, DDXPointPtr ppt, int * pwidth, int nspans, int fSorted) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->SetSpans) (pDrawable, pGC, psrc, ppt, pwidth, nspans, fSorted);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePutImage(DrawablePtr pDrawable, GCPtr pGC, int depth, int x, int y, int w, int h, int leftPad, int format, char * pBits) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PutImage) (pDrawable, pGC, depth, x, y, w, h, leftPad, format, pBits);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static RegionPtr lorieCopyArea(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC, int srcx, int srcy, int w, int h, int dstx, int dsty) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDst);
+    RegionPtr r = (*pGC->ops->CopyArea) (pSrc, pDst, pGC, srcx, srcy, w, h, dstx, dsty);
+    UNLOCK_DRAWABLE(pDst);
+    LORIE_GC_OP_EPILOGUE(pGC)
+    return r;
+}
+
+static RegionPtr lorieCopyPlane(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC, int srcx, int srcy, int width, int height, int dstx, int dsty, unsigned long bitPlane) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDst);
+    RegionPtr r = (*pGC->ops->CopyPlane) (pSrc, pDst, pGC, srcx, srcy, width, height, dstx, dsty, bitPlane);
+    UNLOCK_DRAWABLE(pDst);
+    LORIE_GC_OP_EPILOGUE(pGC)
+    return r;
+}
+
+static void loriePolyPoint(DrawablePtr pDrawable, GCPtr pGC, int mode, int npt, DDXPointPtr pptInit) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolyPoint) (pDrawable, pGC, mode, npt, pptInit);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolylines(DrawablePtr pDrawable, GCPtr pGC, int mode, int npt, DDXPointPtr pptInit) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->Polylines) (pDrawable, pGC, mode, npt, pptInit);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolySegment(DrawablePtr pDrawable, GCPtr pGC, int nseg, xSegment * pSegs) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolySegment) (pDrawable, pGC, nseg, pSegs);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolyRectangle(DrawablePtr pDrawable, GCPtr pGC, int nrects, xRectangle * pRects) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolyRectangle) (pDrawable, pGC, nrects, pRects);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolyArc(DrawablePtr pDrawable, GCPtr pGC, int narcs, xArc * parcs) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolyArc) (pDrawable, pGC, narcs, parcs);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void lorieFillPolygon(DrawablePtr pDrawable, GCPtr pGC, int shape, int mode, int count, DDXPointPtr pPts) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->FillPolygon) (pDrawable, pGC, shape, mode, count, pPts);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolyFillRect(DrawablePtr pDrawable, GCPtr pGC, int nrectFill, xRectangle * prectInit) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolyFillRect) (pDrawable, pGC, nrectFill, prectInit);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolyFillArc(DrawablePtr pDrawable, GCPtr pGC, int narcs, xArc * parcs) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolyFillArc) (pDrawable, pGC, narcs, parcs);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static int loriePolyText8(DrawablePtr pDrawable, GCPtr pGC, int x, int y, int count, char * chars) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    int r = (*pGC->ops->PolyText8) (pDrawable, pGC, x, y, count, chars);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+    return r;
+}
+
+static int loriePolyText16(DrawablePtr pDrawable, GCPtr pGC, int x, int y, int count, unsigned short * chars) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    int r = (*pGC->ops->PolyText16) (pDrawable, pGC, x, y, count, chars);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+    return r;
+}
+
+static void lorieImageText8(DrawablePtr pDrawable, GCPtr pGC, int x, int y, int count, char * chars) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->ImageText8) (pDrawable, pGC, x, y, count, chars);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void lorieImageText16(DrawablePtr pDrawable, GCPtr pGC, int x, int y, int count, unsigned short * chars) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->ImageText16) (pDrawable, pGC, x, y, count, chars);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void lorieImageGlyphBlt(DrawablePtr pDrawable, GCPtr pGC, int x, int y, unsigned int nglyph, CharInfoPtr *ppci, void *pglyphBase) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->ImageGlyphBlt) (pDrawable, pGC, x, y, nglyph, ppci, pglyphBase);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePolyGlyphBlt(DrawablePtr pDrawable, GCPtr pGC, int x, int y, unsigned int nglyph, CharInfoPtr *ppci, void *pglyphBase) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDrawable);
+    (*pGC->ops->PolyGlyphBlt) (pDrawable, pGC, x, y, nglyph, ppci, pglyphBase);
+    UNLOCK_DRAWABLE(pDrawable);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static void loriePushPixels(GCPtr pGC, PixmapPtr pSrc, DrawablePtr pDst, int w, int h, int x, int y) {
+    LORIE_GC_OP_PROLOGUE(pGC)
+    LOCK_DRAWABLE(pDst);
+    (*pGC->ops->PushPixels) (pGC, pSrc, pDst, w, h, x, y);
+    UNLOCK_DRAWABLE(pDst);
+    LORIE_GC_OP_EPILOGUE(pGC)
+}
+
+static const GCOps lorieGCOps = {
+        lorieFillSpans, lorieSetSpans,
+        loriePutImage, lorieCopyArea,
+        lorieCopyPlane, loriePolyPoint,
+        loriePolylines, loriePolySegment,
+        loriePolyRectangle, loriePolyArc,
+        lorieFillPolygon, loriePolyFillRect,
+        loriePolyFillArc, loriePolyText8,
+        loriePolyText16, lorieImageText8,
+        lorieImageText16, lorieImageGlyphBlt,
+        loriePolyGlyphBlt, loriePushPixels,
+};
+
+/*
+ * Root window memory is shared across two processes (X server and Android activity)
+ * so we should make sure there is no simultaneous reading/writing in two different processes.
+ * That means we should lock out interprocess mutex before performing any operation
+ * to prevent tearing and segmentation faults.
+ * We lock mutex for all windows including root window because all windows share root window memory with some offset.
+ */
+
+static Bool
+lorieCreateGC(GCPtr pGC) {
+    ScreenPtr pScreen = pGC->pScreen;
+
+    lorieGCPriv(pGC);
+    Bool ret;
+
+    unwrap(pvfb, pScreen, CreateGC)
+    if ((ret = (*pScreen->CreateGC) (pGC))) {
+        pGCPriv->funcs = pGC->funcs;
+        pGCPriv->ops = pGC->ops;
+        pGC->funcs = &lorieGCFuncs;
+        pGC->ops = &lorieGCOps;
+    }
+    wrap(pvfb, pScreen, CreateGC, lorieCreateGC)
+
+    return ret;
 }
 
 static GLboolean drawableSwapBuffers(unused ClientPtr client, unused __GLXdrawable * drawable) { return TRUE; }
