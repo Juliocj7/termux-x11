@@ -88,7 +88,6 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     static InputMethodManager inputMethodManager;
     private static boolean showIMEWhileExternalConnected = true;
     private static boolean externalKeyboardConnected = false;
-    private boolean mClientConnected = false;
     private View.OnKeyListener mLorieKeyListener;
     private boolean filterOutWinKey = false;
     private boolean useTermuxEKBarBehaviour = false;
@@ -96,7 +95,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
 
     public static Prefs prefs = null;
 
-    private static boolean oldFullscreen = false, oldHideCutout = false, oldXrMode = false;
+    private static boolean oldFullscreen = false, oldHideCutout = false;
     private final SharedPreferences.OnSharedPreferenceChangeListener preferencesChangedListener = (__, key) -> onPreferencesChanged(key);
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
@@ -151,7 +150,6 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
 
         oldFullscreen = prefs.fullscreen.get();
         oldHideCutout = prefs.hideCutout.get();
-        oldXrMode = prefs.xrMode.get();
 
         prefs.get().registerOnSharedPreferenceChangeListener(preferencesChangedListener);
 
@@ -200,7 +198,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
                 name = "External Display";
             LorieView.sendWindowChange(screenWidth, screenHeight, framerate, name);
 
-            if (service != null) {
+            if (service != null && !LorieView.renderingInActivity()) {
                 try {
                     service.windowChanged(sfc);
                 } catch (RemoteException e) {
@@ -223,11 +221,11 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         mNotification = buildNotification();
         mNotificationManager.notify(mNotificationId, mNotification);
 
-        CmdEntryPoint.requestConnection();
+        tryConnect();
         onPreferencesChanged("");
 
         toggleExtraKeys(false, false);
-        checkXEvents();
+        checkRestartInput();
 
         initStylusAuxButtons();
         initMouseAuxButtons();
@@ -251,7 +249,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     //Register the needed events to handle stylus as left, middle and right click
     @SuppressLint("ClickableViewAccessibility")
     private void initStylusAuxButtons() {
-        boolean stylusMenuEnabled = prefs.showStylusClickOverride.get() && mClientConnected;
+        boolean stylusMenuEnabled = prefs.showStylusClickOverride.get() && LorieView.connected();
         final float menuUnselectedTrasparency = 0.66f;
         final float menuSelectedTrasparency = 1.0f;
         Button left = findViewById(R.id.button_left_click);
@@ -339,7 +337,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
 
     private void showStylusAuxButtons(boolean show) {
         LinearLayout buttons = findViewById(R.id.mouse_helper_visibility);
-        if (mClientConnected && show) {
+        if (LorieView.connected() && show) {
             buttons.setVisibility(View.VISIBLE);
             buttons.setAlpha(isInPictureInPictureMode ? 0.f : 1.f);
         } else {
@@ -382,7 +380,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
 
     private void showMouseAuxButtons(boolean show) {
         View v = findViewById(R.id.mouse_buttons);
-        v.setVisibility((mClientConnected && show && "1".equals(prefs.touchMode.get())) ? View.VISIBLE : View.GONE);
+        v.setVisibility((LorieView.connected() && show && "1".equals(prefs.touchMode.get())) ? View.VISIBLE : View.GONE);
         v.setAlpha(isInPictureInPictureMode ? 0.f : 0.7f);
         makeSureHelpersAreVisibleAndInScreenBounds();
     }
@@ -501,10 +499,9 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         try {
             service.asBinder().linkToDeath(() -> {
                 service = null;
-                CmdEntryPoint.requestConnection();
 
                 Log.v("Lorie", "Disconnected");
-                runOnUiThread(() -> clientConnectedStateChanged(false));
+                runOnUiThread(() -> { LorieView.connect(-1); clientConnectedStateChanged();} );
             }, 0);
         } catch (RemoteException ignored) {}
 
@@ -526,24 +523,32 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     }
 
     void tryConnect() {
-        if (mClientConnected)
+        if (LorieView.connected())
             return;
+
+        if (service == null) {
+            LorieView.requestConnection();
+            handler.postDelayed(this::tryConnect, 250);
+            return;
+        }
+
         try {
-            ParcelFileDescriptor fd = service == null ? null : service.getXConnection();
+            ParcelFileDescriptor fd = service.getXConnection();
             if (fd != null) {
                 Log.v("MainActivity", "Extracting X connection socket.");
                 LorieView.connect(fd.detachFd());
                 getLorieView().triggerCallback();
-                clientConnectedStateChanged(true);
+                clientConnectedStateChanged();
                 getLorieView().reloadPreferences(prefs);
             } else
-                handler.postDelayed(this::tryConnect, 500);
+                handler.postDelayed(this::tryConnect, 250);
         } catch (Exception e) {
             Log.e("MainActivity", "Something went wrong while we were establishing connection", e);
             service = null;
 
             // We should reset the View for the case if we have sent it's surface to the client.
             getLorieView().regenerate();
+            handler.postDelayed(this::tryConnect, 250);
         }
     }
 
@@ -555,25 +560,9 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         handler.postDelayed(this::onPreferencesChangedCallback, 100);
     }
 
-    /** @noinspection CommentedOutCode*/
     @SuppressLint("UnsafeIntentLaunch")
     void onPreferencesChangedCallback() {
         prefs.recheckStoringSecondaryDisplayPreferences();
-
-        if (oldXrMode != prefs.xrMode.get() && XrActivity.isSupported()) {
-            getBaseContext().startActivity(new Intent(this, MainActivity.class)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
-
-            if (oldXrMode) {
-                // XR process and 2D preferences screen are two different processes.
-                // To close XR, it is needed to do it using a broadcast.
-                Intent intent = new Intent(XrActivity.ACTION_STOP_XR);
-                intent.setPackage(getPackageName());
-                getBaseContext().sendBroadcast(intent);
-            }
-            finish();
-            return;
-        }
 
         onWindowFocusChanged(hasWindowFocus());
         LorieView lorieView = getLorieView();
@@ -594,7 +583,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         useTermuxEKBarBehaviour = prefs.useTermuxEKBarBehaviour.get();
         showIMEWhileExternalConnected = prefs.showIMEWhileExternalConnected.get();
 
-        findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && mClientConnected ? View.VISIBLE : View.GONE);
+        findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && LorieView.connected() ? View.VISIBLE : View.GONE);
         showMouseAuxButtons(prefs.showMouseHelper.get());
         showStylusAuxButtons(prefs.showStylusClickOverride.get());
 
@@ -644,7 +633,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         final ViewPager pager = getTerminalToolbarViewPager();
         ViewGroup parent = (ViewGroup) pager.getParent();
 
-        boolean showNow = mClientConnected && prefs.showAdditionalKbd.get() && prefs.additionalKbdVisible.get();
+        boolean showNow = LorieView.connected() && prefs.showAdditionalKbd.get() && prefs.additionalKbdVisible.get();
 
         pager.setVisibility(showNow ? View.VISIBLE : View.INVISIBLE);
 
@@ -672,7 +661,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     public void toggleExtraKeys(boolean visible, boolean saveState) {
         boolean enabled = prefs.showAdditionalKbd.get();
 
-        if (enabled && mClientConnected && saveState)
+        if (enabled && LorieView.connected() && saveState)
             prefs.additionalKbdVisible.put(visible);
 
         setTerminalToolbarView();
@@ -859,17 +848,11 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     }
 
     @SuppressWarnings("SameParameterValue")
-    void clientConnectedStateChanged(boolean connected) {
-        if (connected && XrActivity.isEnabled() && !(this instanceof XrActivity)) {
-            XrActivity.openIntent(this);
-            mClientConnected = true;
-            return;
-        }
-
+    void clientConnectedStateChanged() {
         runOnUiThread(()-> {
-            mClientConnected = connected;
+            boolean connected = LorieView.connected();
             setTerminalToolbarView();
-            findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && mClientConnected ? View.VISIBLE : View.GONE);
+            findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && connected ? View.VISIBLE : View.GONE);
             findViewById(R.id.stub).setVisibility(connected?View.INVISIBLE:View.VISIBLE);
             getLorieView().setVisibility(connected?View.VISIBLE:View.INVISIBLE);
             getLorieView().regenerate();
@@ -877,8 +860,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
             // We should recover connection in the case if file descriptor for some reason was broken...
             if (!connected)
                 tryConnect();
-
-            if (connected)
+            else
                 getLorieView().setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
         });
     }
@@ -887,17 +869,16 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         if (getInstance() == null)
             return false;
 
-        return getInstance().mClientConnected;
+        return LorieView.connected();
     }
 
-    private void checkXEvents() {
-        getLorieView().handleXEvents();
+    private void checkRestartInput() {
         // an imperfect workaround for Gboard CJK keyboard in DeX soft keyboard mode
         // in that particular mode during language switching, InputConnection#requestCursorUpdates() is not called and no signal can be picked up. 
         // therefore, check to activate CJK keyboard is done upon a keypress.  
         if (getLorieView().enableGboardCJK && SamsungDexUtils.checkDeXEnabled(this))
             getLorieView().checkRestartInput(false);
-        handler.postDelayed(this::checkXEvents, 300);
+        handler.postDelayed(this::checkRestartInput, 300);
     }
 
     public static void getRealMetrics(DisplayMetrics m) {

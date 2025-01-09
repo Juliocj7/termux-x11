@@ -35,6 +35,9 @@ import com.termux.x11.input.TouchInputHandler;
 import java.nio.charset.StandardCharsets;
 import java.util.regex.PatternSyntaxException;
 
+import dalvik.annotation.optimization.CriticalNative;
+import dalvik.annotation.optimization.FastNative;
+
 @Keep @SuppressLint("WrongConstant")
 @SuppressWarnings("deprecation")
 public class LorieView extends SurfaceView implements InputStub {
@@ -50,7 +53,7 @@ public class LorieView extends SurfaceView implements InputStub {
     private long lastClipboardTimestamp = System.currentTimeMillis();
     private static boolean clipboardSyncEnabled = false;
     private static boolean hardwareKbdScancodesWorkaround = false;
-    private final InputMethodManager mIMM = (InputMethodManager)getContext().getSystemService( Context.INPUT_METHOD_SERVICE);
+    private final InputMethodManager mIMM = (InputMethodManager)getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
     private String mImeLang;
     private boolean mImeCJK;
     public boolean enableGboardCJK;
@@ -70,12 +73,15 @@ public class LorieView extends SurfaceView implements InputStub {
                 return;
 
             getDimensionsFromSettings();
-            mCallback.changed(holder.getSurface(), width, height, p.x, p.y);
+            if (mCallback != null)
+                mCallback.changed(holder.getSurface(), width, height, p.x, p.y);
+            LorieView.this.surfaceChanged(holder.getSurface());
         }
 
         @Override public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
             if (mCallback != null)
                 mCallback.changed(holder.getSurface(), 0, 0, 0, 0);
+            LorieView.this.surfaceChanged(holder.getSurface());
         }
     };
 
@@ -88,6 +94,7 @@ public class LorieView extends SurfaceView implements InputStub {
     private void init() {
         getHolder().addCallback(mSurfaceCallback);
         clipboard = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        nativeInit();
     }
 
     public void setCallback(Callback callback) {
@@ -138,10 +145,6 @@ public class LorieView extends SurfaceView implements InputStub {
         Prefs prefs = MainActivity.getPrefs();
         int width = getMeasuredWidth();
         int height = getMeasuredHeight();
-        if (XrActivity.isEnabled()) {
-            width = 1024;
-            height = 768;
-        }
         int w = width;
         int h = height;
         switch(prefs.displayResolutionMode.get()) {
@@ -184,11 +187,8 @@ public class LorieView extends SurfaceView implements InputStub {
         if (prefs.displayStretch.get()
               || "native".equals(prefs.displayResolutionMode.get())
               || "scaled".equals(prefs.displayResolutionMode.get())) {
-
-            if (!XrActivity.isEnabled()) {
-                getHolder().setSizeFromLayout();
-                return;
-            }
+            getHolder().setSizeFromLayout();
+            return;
         }
 
         getDimensionsFromSettings();
@@ -211,7 +211,7 @@ public class LorieView extends SurfaceView implements InputStub {
         getHolder().setFixedSize(p.x, p.y);
         setMeasuredDimension(width, height);
 
-        // In the case if old fixed surface size equals new fixed surface size surfaceChanged will not be called.
+        // In the case if old fixed surface size equals new fixed surface size windowChanged will not be called.
         // We should force it.
         regenerate();
     }
@@ -361,21 +361,25 @@ public class LorieView extends SurfaceView implements InputStub {
         }
     }
 
-    static native void connect(int fd);
-    native void handleXEvents();
-    static native void startLogcat(int fd);
-    static native void setClipboardSyncEnabled(boolean enabled, boolean ignored);
-    public native void sendClipboardAnnounce();
-    public native void sendClipboardEvent(byte[] text);
-    static native void sendWindowChange(int width, int height, int framerate, String name);
-    public native void sendMouseEvent(float x, float y, int whichButton, boolean buttonDown, boolean relative);
-    public native void sendTouchEvent(int action, int id, int x, int y);
-    public native void sendStylusEvent(float x, float y, int pressure, int tiltX, int tiltY, int orientation, int buttons, boolean eraser, boolean mouseMode);
-    static public native void requestStylusEnabled(boolean enabled);
-    public native boolean sendKeyEvent(int scanCode, int keyCode, boolean keyDown);
-    public native void sendTextEvent(byte[] text);
+    static native boolean renderingInActivity();
+    @FastNative private native void nativeInit();
+    @FastNative private native void surfaceChanged(Surface surface);
+    @FastNative static native void connect(int fd);
+    @CriticalNative static native boolean connected();
+    @FastNative static native void startLogcat(int fd);
+    @FastNative static native void setClipboardSyncEnabled(boolean enabled, boolean ignored);
+    @FastNative public native void sendClipboardAnnounce();
+    @FastNative public native void sendClipboardEvent(byte[] text);
+    @FastNative static native void sendWindowChange(int width, int height, int framerate, String name);
+    @FastNative public native void sendMouseEvent(float x, float y, int whichButton, boolean buttonDown, boolean relative);
+    @FastNative public native void sendTouchEvent(int action, int id, int x, int y);
+    @FastNative public native void sendStylusEvent(float x, float y, int pressure, int tiltX, int tiltY, int orientation, int buttons, boolean eraser, boolean mouseMode);
+    @FastNative static public native void requestStylusEnabled(boolean enabled);
+    @FastNative public native boolean sendKeyEvent(int scanCode, int keyCode, boolean keyDown);
+    @FastNative public native void sendTextEvent(byte[] text);
+    @CriticalNative public static native void requestConnection();
 
     static {
-        System.loadLibrary("lorie");
+        System.loadLibrary("Xlorie");
     }
 }

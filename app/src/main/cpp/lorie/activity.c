@@ -10,15 +10,24 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <jni.h>
+#include <android/looper.h>
 #include <wchar.h>
+#include <linux/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include "lorie.h"
 
 #pragma clang diagnostic ignored "-Wunknown-pragmas"
 #pragma ide diagnostic ignored "cppcoreguidelines-narrowing-conversions"
+#pragma ide diagnostic ignored "ConstantFunctionResult"
 #define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
 
-extern char *__progname; // NOLINT(bugprone-reserved-identifier)
-static int conn_fd = -1;
+extern volatile int conn_fd; // The only variable from shared with X server code.
+
+static struct {
+    jclass self;
+    jmethodID getInstance, clientConnectedStateChanged;
+} MainActivity = {0};
 
 static struct {
     jclass self;
@@ -31,8 +40,8 @@ static struct {
     jmethodID toString;
 } CharBuffer = {0};
 
-static struct lorie_shared_server_state* state = NULL;
-static AHardwareBuffer* sharedBuffer = NULL;
+static JNIEnv *guienv = NULL; // Must be used only in GUI thread.
+static jobject globalThiz = NULL;
 
 static jclass FindClassOrDie(JNIEnv *env, const char* name) {
     jclass clazz = (*env)->FindClass(env, name);
@@ -61,26 +70,39 @@ static jclass FindMethodOrDie(JNIEnv *env, jclass clazz, const char* name, const
     return method;
 }
 
-static inline void checkConnection(JNIEnv* env) {
-    int retval, b = 0;
+static void requestConnection(__unused JNIEnv *env, __unused jclass clazz) {
+#define check(cond, fmt, ...) if ((cond)) do { __android_log_print(ANDROID_LOG_ERROR, "requestConnection", fmt, ## __VA_ARGS__); goto end; } while (0)
+    // We do not want to block GUI thread for a long time so we will set timeout to 20 msec.
+    struct sockaddr_in server = { .sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = inet_addr("127.0.0.1") };
+    int so_error, sock = socket(AF_INET, SOCK_STREAM, 0);
+    check(sock < 0, "Could not create socket: %s", strerror(errno));
+    check(fcntl(sock, F_SETFL, O_NONBLOCK) < 0, "failed to set socket non-block: %s", strerror(errno));
+    int r = connect(sock, (struct sockaddr *)&server, sizeof(server));
+    check(r < 0 && errno != EINPROGRESS, "failed to connect socket: %s", strerror(errno));
+    if (r < 0 && errno == EINPROGRESS) {
+        // Connection is in progress; use poll to wait for it
+        struct pollfd pfd = { .fd = sock, .events = POLLOUT };
+        r = poll(&pfd, 1, 20);  // timeout set to 50ms
+        if (!r) goto end;
+        // check(!r, "Connection timed out after 20ms."); // We do not want to flood logcat with this message
+        check(r < 0, "poll failed: %s", strerror(errno));
+        socklen_t len = sizeof(so_error);
+        check(getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0, "getsockopt failed: %s", strerror(errno));
+        check(so_error != 0, "Connection failed: %s", strerror(so_error));
 
-    if (conn_fd == -1)
-        return;
-
-    if ((retval = recv(conn_fd, &b, 1, MSG_PEEK)) <= 0 && errno != EAGAIN) {
-        log(DEBUG, "recv %d %s", retval, strerror(errno));
-        jclass cls = (*env)->FindClass(env, "com/termux/x11/CmdEntryPoint");
-        jmethodID method = !cls ? NULL : (*env)->GetStaticMethodID(env, cls, "requestConnection", "()V");
-        if (method)
-            (*env)->CallStaticVoidMethod(env, cls, method);
-
-        close(conn_fd);
-        conn_fd = -1;
+        check(write(sock, MAGIC, sizeof(MAGIC)) < 0, "failed to send message: %s", strerror(errno));
+        goto end;
     }
+
+    check(1, "something went wrong: %s, %s", strerror(errno), strerror(r));
+
+    end: if (sock >= 0) close(sock);
+#undef errorReturn
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_connect(__unused JNIEnv* env, __unused jobject cls, jint fd) {
+static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd);
+static void nativeInit(JNIEnv *env, jobject thiz) {
+    JavaVM* vm;
     if (!Charset.self) {
         // Init clipboard-related JNI stuff
         Charset.self = FindClassOrDie(env, "java/nio/charset/Charset");
@@ -89,17 +111,38 @@ Java_com_termux_x11_LorieView_connect(__unused JNIEnv* env, __unused jobject cls
 
         CharBuffer.self = FindClassOrDie(env,  "java/nio/CharBuffer");
         CharBuffer.toString = FindMethodOrDie(env, CharBuffer.self, "toString", "()Ljava/lang/String;", JNI_FALSE);
+
+        MainActivity.self = FindClassOrDie(env,  "com/termux/x11/MainActivity");
+        MainActivity.getInstance = FindMethodOrDie(env, MainActivity.self, "getInstance", "()Lcom/termux/x11/MainActivity;", JNI_TRUE);
+        MainActivity.clientConnectedStateChanged = FindMethodOrDie(env, MainActivity.self, "clientConnectedStateChanged", "()V", JNI_FALSE);
     }
 
-    conn_fd = fd;
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    checkConnection(env);
-    log(DEBUG, "XCB connection is successfull");
+    (*env)->GetJavaVM(env, &vm);
+    (*vm)->AttachCurrentThread(vm, &guienv, NULL);
+    globalThiz = (*guienv)->NewGlobalRef(env, thiz);
+    connect_(NULL, NULL, -1);
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_handleXEvents(JNIEnv *env, jobject thiz) {
-    checkConnection(env);
+static int xcallback(int fd, int events, __unused void* data) {
+    JNIEnv *env = guienv;
+    jobject thiz = globalThiz;
+
+    if (events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) {
+        jobject instance = (*env)->CallStaticObjectMethod(env, MainActivity.self, MainActivity.getInstance);
+        if (instance)
+            (*env)->CallVoidMethod(env, instance, MainActivity.clientConnectedStateChanged);
+
+        ALooper_removeFd(ALooper_forThread(), fd);
+        close(conn_fd);
+        conn_fd = -1;
+#if RENDERER_IN_ACTIVITY
+        renderer_set_shared_state(NULL);
+        renderer_set_buffer(NULL);
+#endif
+        log(DEBUG, "disconnected");
+        return 1;
+    }
+
     if (conn_fd != -1) {
         lorieEvent e = {0};
 
@@ -129,25 +172,38 @@ Java_com_termux_x11_LorieView_handleXEvents(JNIEnv *env, jobject thiz) {
                     break;
                 }
                 case EVENT_SHARED_SERVER_STATE: {
-                    int fd = ancil_recv_fd(conn_fd);
+                    struct lorie_shared_server_state* state = NULL;
+                    int stateFd = ancil_recv_fd(conn_fd);
 
-                    if (!(state = mmap(NULL, sizeof(*state), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)))
-                        log(ERROR, "Failed to map server state.");
+                    if (stateFd < 0)
+                        break;
 
-                    close(fd); // Closing file descriptor does not unmmap shared memory fragment.
+                    state = mmap(NULL, sizeof(*state), PROT_READ|PROT_WRITE, MAP_SHARED, stateFd, 0);
+                    if (!state || state == MAP_FAILED) {
+                        log(ERROR, "Failed to map server state: %s", strerror(errno));
+                        state = NULL;
+                    }
+
+#if RENDERER_IN_ACTIVITY
+                    renderer_set_shared_state(state);
+#else
+                    // Should pass it to renderer thread here, but currently it is not implemented...
+                    munmap(state, sizeof(*state));
+#endif
+
+                    close(stateFd); // Closing file descriptor does not unmmap shared memory fragment.
                     break;
                 }
                 case EVENT_SHARED_ROOT_WINDOW_BUFFER: {
-                    if (sharedBuffer)
-                        AHardwareBuffer_release(sharedBuffer);
-                    int error = AHardwareBuffer_recvHandleFromUnixSocket(conn_fd, &sharedBuffer);
-                    AHardwareBuffer_Desc desc = {0};
-                    if (sharedBuffer)
-                        AHardwareBuffer_describe(sharedBuffer, &desc);
+                    static LorieBuffer* buffer = NULL;
+                    LorieBuffer_Desc desc = {0};
+                    LorieBuffer_recvHandleFromUnixSocket(conn_fd, &buffer);
+                    LorieBuffer_describe(buffer, &desc);
                     log(INFO, "Received shared buffer width %d height %d format %d", desc.width, desc.height, desc.format);
-                }
-                case EVENT_REQUEST_RENDER: {
-                    // Currently not implemented, renderer is still running in X server process.
+#if RENDERER_IN_ACTIVITY
+                    renderer_set_buffer(buffer);
+#endif
+                    LorieBuffer_release(buffer);
                 }
             }
         }
@@ -156,10 +212,27 @@ Java_com_termux_x11_LorieView_handleXEvents(JNIEnv *env, jobject thiz) {
         if (ioctl(conn_fd, FIONREAD, &n) >= 0 && n > sizeof(e))
             goto again;
     }
+
+    return 1;
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_startLogcat(JNIEnv *env, __unused jobject cls, jint fd) {
+static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd) {
+    if (conn_fd != -1) {
+        ALooper_removeFd(ALooper_forThread(), conn_fd);
+        close(conn_fd);
+    }
+
+    if ((conn_fd = fd) != -1) {
+        ALooper_addFd(ALooper_forThread(), fd, 0, ALOOPER_EVENT_INPUT | ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP, xcallback, NULL);
+        log(DEBUG, "XCB connection is successfull");
+    }
+}
+
+static jboolean connected(JNIEnv* env, jclass clazz) {
+    return conn_fd != -1;
+}
+
+static void startLogcat(JNIEnv *env, __unused jobject cls, jint fd) {
     log(DEBUG, "Starting logcat with output to given fd");
 
     switch(fork()) {
@@ -178,26 +251,21 @@ Java_com_termux_x11_LorieView_startLogcat(JNIEnv *env, __unused jobject cls, jin
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_setClipboardSyncEnabled(__unused JNIEnv* env, __unused jobject cls, jboolean enable, __unused jboolean ignored) {
+static void setClipboardSyncEnabled(__unused JNIEnv* env, __unused jobject cls, jboolean enable, __unused jboolean ignored) {
     if (conn_fd != -1) {
         lorieEvent e = { .clipboardEnable = { .t = EVENT_CLIPBOARD_ENABLE, .enable = enable } };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendClipboardAnnounce(JNIEnv *env, __unused jobject thiz) {
+static void sendClipboardAnnounce(__unused JNIEnv *env, __unused jobject thiz) {
     if (conn_fd != -1) {
         lorieEvent e = { .type = EVENT_CLIPBOARD_ANNOUNCE };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendClipboardEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
+static void sendClipboardEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
     if (conn_fd != -1 && text) {
         jsize length = (*env)->GetArrayLength(env, text);
         jbyte* str = (*env)->GetByteArrayElements(env, text, NULL);
@@ -205,12 +273,10 @@ Java_com_termux_x11_LorieView_sendClipboardEvent(JNIEnv *env, __unused jobject t
         write(conn_fd, &e, sizeof(e));
         write(conn_fd, str, length);
         (*env)->ReleaseByteArrayElements(env, text, str, JNI_ABORT);
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendWindowChange(__unused JNIEnv* env, __unused jobject cls, jint width, jint height, jint framerate, jstring jname) {
+static void sendWindowChange(__unused JNIEnv* env, __unused jobject cls, jint width, jint height, jint framerate, jstring jname) {
     if (conn_fd != -1) {
         const char *name = (!jname || width <= 0 || height <= 0) ? NULL : (*env)->GetStringUTFChars(env, jname, JNI_FALSE);
         lorieEvent e = { .screenSize = { .t = EVENT_SCREEN_SIZE, .width = width, .height = height, .framerate = framerate, .name_size = (name ? strlen(name) : 0) } };
@@ -219,68 +285,56 @@ Java_com_termux_x11_LorieView_sendWindowChange(__unused JNIEnv* env, __unused jo
             write(conn_fd, name, strlen(name));
             (*env)->ReleaseStringUTFChars(env, jname, name);
         }
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendMouseEvent(__unused JNIEnv* env, __unused jobject cls, jfloat x, jfloat y, jint which_button, jboolean button_down, jboolean relative) {
+static void sendMouseEvent(__unused JNIEnv* env, __unused jobject cls, jfloat x, jfloat y, jint which_button, jboolean button_down, jboolean relative) {
     if (conn_fd != -1) {
         lorieEvent e = { .mouse = { .t = EVENT_MOUSE, .x = x, .y = y, .detail = which_button, .down = button_down, .relative = relative } };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendTouchEvent(__unused JNIEnv* env, __unused jobject cls, jint action, jint id, jint x, jint y) {
+static void sendTouchEvent(__unused JNIEnv* env, __unused jobject cls, jint action, jint id, jint x, jint y) {
     if (conn_fd != -1 && action != -1) {
         lorieEvent e = { .touch = { .t = EVENT_TOUCH, .type = action, .id = id, .x = x, .y = y } };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendStylusEvent(JNIEnv *env, __unused jobject thiz, jfloat x, jfloat y,
-                                              jint pressure, jint tilt_x, jint tilt_y,
-                                              jint orientation, jint buttons, jboolean eraser, jboolean mouse) {
+static void sendStylusEvent(__unused JNIEnv *env, __unused jobject thiz, jfloat x, jfloat y,
+                            jint pressure, jint tilt_x, jint tilt_y,
+                            jint orientation, jint buttons, jboolean eraser, jboolean mouse) {
     if (conn_fd != -1) {
         lorieEvent e = { .stylus = { .t = EVENT_STYLUS, .x = x, .y = y, .pressure = pressure, .tilt_x = tilt_x, .tilt_y = tilt_y, .orientation = orientation, .buttons = buttons, .eraser = eraser, .mouse = mouse } };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_requestStylusEnabled(JNIEnv *env, __unused jclass clazz, jboolean enabled) {
+static void requestStylusEnabled(__unused JNIEnv *env, __unused jclass clazz, jboolean enabled) {
     if (conn_fd != -1) {
         lorieEvent e = { .stylusEnable = { .t = EVENT_STYLUS_ENABLE, .enable = enabled } };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_termux_x11_LorieView_sendKeyEvent(__unused JNIEnv* env, __unused jobject cls, jint scan_code, jint key_code, jboolean key_down) {
+static jboolean sendKeyEvent(__unused JNIEnv* env, __unused jobject cls, jint scan_code, jint key_code, jboolean key_down) {
     if (conn_fd != -1) {
         int code = (scan_code) ?: android_to_linux_keycode[key_code];
         log(DEBUG, "Sending key: %d (%d %d %d)", code + 8, scan_code, key_code, key_down);
         lorieEvent e = { .key = { .t = EVENT_KEY, .key = code + 8, .state = key_down } };
         write(conn_fd, &e, sizeof(e));
-        checkConnection(env);
     }
 
     return true;
 }
 
-JNIEXPORT void JNICALL
-Java_com_termux_x11_LorieView_sendTextEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
+static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
     if (conn_fd != -1 && text) {
         jsize length = (*env)->GetArrayLength(env, text);
         jbyte *str = (*env)->GetByteArrayElements(env, text, NULL);
         char *p = (char*) str;
-        mbstate_t state = { 0 };
+        mbstate_t mbstate = { 0 };
         if (!length)
             return;
 
@@ -288,7 +342,7 @@ Java_com_termux_x11_LorieView_sendTextEvent(JNIEnv *env, __unused jobject thiz, 
 
         while (*p) {
             wchar_t wc;
-            size_t len = mbrtowc(&wc, p, MB_CUR_MAX, &state);
+            size_t len = mbrtowc(&wc, p, MB_CUR_MAX, &mbstate);
 
             if (len == (size_t)-1 || len == (size_t)-2) {
                 log(ERROR, "Invalid UTF-8 sequence encountered");
@@ -308,11 +362,56 @@ Java_com_termux_x11_LorieView_sendTextEvent(JNIEnv *env, __unused jobject thiz, 
         }
 
         (*env)->ReleaseByteArrayElements(env, text, str, JNI_ABORT);
-        checkConnection(env);
     }
 }
 
-#if 1
+static void surfaceChanged(JNIEnv *env, jobject thiz, jobject sfc) {
+#if RENDERER_IN_ACTIVITY
+    ANativeWindow* win = sfc ? ANativeWindow_fromSurface(env, sfc) : NULL;
+    if (win)
+        ANativeWindow_acquire(win);
+
+    renderer_set_window(win);
+#endif
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_termux_x11_LorieView_renderingInActivity(JNIEnv *env, jobject thiz) {
+    return RENDERER_IN_ACTIVITY;
+}
+
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+    JNIEnv* env;
+    static JNINativeMethod methods[] = {
+            {"nativeInit", "()V", (void *)&nativeInit},
+            {"surfaceChanged", "(Landroid/view/Surface;)V", (void *)&surfaceChanged},
+            {"connect", "(I)V", (void *)&connect_},
+            {"connected", "()Z", (void *)&connected},
+            {"startLogcat", "(I)V", (void *)&startLogcat},
+            {"setClipboardSyncEnabled", "(ZZ)V", (void *)&setClipboardSyncEnabled},
+            {"sendClipboardAnnounce", "()V", (void *)&sendClipboardAnnounce},
+            {"sendClipboardEvent", "([B)V", (void *)&sendClipboardEvent},
+            {"sendWindowChange", "(IIILjava/lang/String;)V", (void *)&sendWindowChange},
+            {"sendMouseEvent", "(FFIZZ)V", (void *)&sendMouseEvent},
+            {"sendTouchEvent", "(IIII)V", (void *)&sendTouchEvent},
+            {"sendStylusEvent", "(FFIIIIIZZ)V", (void *)&sendStylusEvent},
+            {"requestStylusEnabled", "(Z)V", (void *)&requestStylusEnabled},
+            {"sendKeyEvent", "(IIZ)Z", (void *)&sendKeyEvent},
+            {"sendTextEvent", "([B)V", (void *)&sendTextEvent},
+            {"requestConnection", "()V", (void *)&requestConnection},
+    };
+    (*vm)->AttachCurrentThread(vm, &env, NULL);
+    jclass cls = (*env)->FindClass(env, "com/termux/x11/LorieView");
+    (*env)->RegisterNatives(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+
+#if RENDERER_IN_ACTIVITY
+    renderer_init(env);
+#endif
+
+    return JNI_VERSION_1_6;
+}
+
+
 // It is needed to redirect stderr to logcat
 static void* stderrToLogcatThread(__unused void* cookie) {
     FILE *fp;
@@ -332,8 +431,9 @@ static void* stderrToLogcatThread(__unused void* cookie) {
     return NULL;
 }
 
+extern char* __progname;
 __attribute__((constructor)) static void init(void) {
     pthread_t t;
-    pthread_create(&t, NULL, stderrToLogcatThread, NULL);
+    if (!strcmp(__progname, "com.termux.x11"))
+        pthread_create(&t, NULL, stderrToLogcatThread, NULL);
 }
-#endif

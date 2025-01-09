@@ -1,18 +1,26 @@
 #pragma once
+#define RENDERER_IN_ACTIVITY 0
 
 #include <android/hardware_buffer.h>
+#include <android/native_window_jni.h>
 #include <android/choreographer.h>
 #include <android/log.h>
 
+#include <stdbool.h>
 #include <X11/Xdefs.h>
 #include <X11/keysymdef.h>
 #include <jni.h>
 #include <screenint.h>
 #include <sys/socket.h>
 #include "linux/input-event-codes.h"
+#include "buffer.h"
+
+#define PORT 7892
+#define MAGIC "0xDEADBEEF"
+
+struct lorie_shared_server_state;
 
 void lorieSetVM(JavaVM* vm);
-Bool lorieChangeWindow(ClientPtr pClient, void *closure);
 void lorieConfigureNotify(int width, int height, int framerate, size_t name_size, char* name);
 void lorieEnableClipboardSync(Bool enable);
 void lorieSendClipboardData(const char* data);
@@ -26,14 +34,57 @@ void lorieTriggerWorkingQueue(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
-void lorieSendRootWindowBuffer(AHardwareBuffer* buffer);
-void lorieRequestRender(void);
+void lorieSendRootWindowBuffer(LorieBuffer* buffer);
+bool lorieConnectionAlive(void);
+
+__unused int renderer_init(JNIEnv* env);
+__unused void renderer_test_capabilities(int* legacy_drawing, uint8_t* flip);
+__unused void renderer_set_buffer(LorieBuffer* buffer);
+#if RENDERER_IN_ACTIVITY
+__unused void renderer_set_window(ANativeWindow* win);
+#else
+__unused void renderer_set_window(JNIEnv* env, jobject surface);
+#endif
+__unused void renderer_set_shared_state(struct lorie_shared_server_state* state);
+
+static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex) {
+    // Unfortunately there is no robust mutexes in bionic.
+    // Posix does not define any valid way to unlock stuck non-robust mutex
+    // so in the case if renderer or X server process unexpectedly die with locked mutex
+    // we will simply reinitialize it.
+    struct timespec ts = {0};
+    while(true) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+
+        // 33 msec is enough to complete any drawing operation on both X server and renderer side
+        // In the case if mutex is locked most likely other thread died with the mutex locked
+        ts.tv_nsec += 33UL * 1000000UL;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec  += ts.tv_nsec / 1000000000L;
+            ts.tv_nsec  = ts.tv_nsec % 1000000000L;
+        }
+
+        if (pthread_mutex_timedlock(mutex, &ts) == ETIMEDOUT && !lorieConnectionAlive()) {
+            pthread_mutexattr_t attr;
+            pthread_mutex_t initializer = PTHREAD_MUTEX_INITIALIZER;
+            pthread_mutexattr_init(&attr);
+            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+            pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+            memcpy(mutex, &initializer, sizeof(initializer));
+            pthread_mutex_init(mutex, &attr);
+            // Mutex will be locked fine on the next iteration
+        } else return;
+    }
+}
+
+static inline __always_inline void lorie_mutex_unlock(pthread_mutex_t* mutex) {
+    pthread_mutex_unlock(mutex);
+}
 
 typedef enum {
     EVENT_UNKNOWN,
     EVENT_SHARED_SERVER_STATE,
     EVENT_SHARED_ROOT_WINDOW_BUFFER,
-    EVENT_REQUEST_RENDER,
     EVENT_SCREEN_SIZE,
     EVENT_TOUCH,
     EVENT_MOUSE,
@@ -95,11 +146,52 @@ typedef union {
 } lorieEvent;
 
 struct lorie_shared_server_state {
+    /*
+     * Renderer and X server are separated into 2 different processes.
+     * Root window and cursor content and properties are shared across these 2 processes.
+     * Reading/drawing root window in renderer the same time X server writes it can cause
+     * tearing, texture garbling and other visual artifacts so we should block X server while we are drawing.
+     */
     pthread_mutex_t lock; // initialized at X server side.
+
+    /*
+     * Renderer thread sleeps when it is idle so we must explicitly wake it up.
+     */
+    pthread_cond_t cond; // initialized at X server side.
+
+    /* A signal to renderer to update root window texture content from shared fragment if needed */
+    volatile uint8_t drawRequested;
+
+    /* We should avoid triggering renderer if there is no output surface */
+    volatile uint8_t surfaceAvailable;
+
+    /*
+     * We do not want to block the X server for an extended period; ideally, we would avoid blocking it at all.
+     * However, if we don’t block the X server, it will overwrite root window memory fragment, causing tearing or frame distortion.
+     * On some devices, there is no way to make EGL/GLES2 render a frame without calling eglSwapBuffers;
+     * calls like glFinish, eglWaitGL, and eglWaitClient have no effect.
+     * The only way to force EGL to render a frame and flush the command queue is by invoking eglSwapBuffers.
+     * But eglSwapBuffers will not return until Android actually displays the frame.
+     * Since we want to proceed as quickly as possible, waiting for the frame to be shown is not acceptable.
+     *
+     * Therefore, we set eglSwapInterval(dpy, 1), so that eglSwapBuffers does not block until the frame is displayed.
+     * Even then, we do not want to waste GPU resources rendering more than one full-screen quad per vsync,
+     * because that would spend GPU time on a frame that will never be shown.
+     * To handle this, we use a waitForNextFrame flag, which we set after a successful render and clear from the AChoreographer’s frame callback.
+     */
+    volatile uint8_t waitForNextFrame;
+
+    /* Needed to show FPS counter in logcat */
+    volatile int renderedFrames;
+
     struct {
+        // We should not allow updating cursor content the same time renderer draws it.
+        // locking the mutex protecting the root window can cause waiting for the frame to be drawn which is unacceptable
+        pthread_mutex_t lock; // initialized at X server side.
         uint32_t x, y, xhot, yhot, width, height;
         uint32_t bits[512*512]; // 1 megabyte should be enough for any cursor up to 512x512
-        uint8_t updated;
+        // Signals to renderer to update cursor's texture or its coordinates
+        volatile uint8_t updated, moved;
     } cursor;
 };
 
@@ -247,63 +339,3 @@ static int android_to_linux_keycode[304] = {
         [ 208  /* ANDROID_KEYCODE_CALENDAR */] = KEY_CALENDAR,
         [ 210  /* ANDROID_KEYCODE_CALCULATOR */] = KEY_CALC,
 };
-
-__always_inline static inline int ancil_send_fd(int sock, int fd)
-{
-    char nothing = '!';
-    struct iovec nothing_ptr = { .iov_base = &nothing, .iov_len = 1 };
-
-    struct {
-        struct cmsghdr align;
-        int fd[1];
-    } ancillary_data_buffer;
-
-    struct msghdr message_header = {
-            .msg_name = NULL,
-            .msg_namelen = 0,
-            .msg_iov = &nothing_ptr,
-            .msg_iovlen = 1,
-            .msg_flags = 0,
-            .msg_control = &ancillary_data_buffer,
-            .msg_controllen = sizeof(struct cmsghdr) + sizeof(int)
-    };
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&message_header);
-    cmsg->cmsg_len = message_header.msg_controllen; // sizeof(int);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    ((int*) CMSG_DATA(cmsg))[0] = fd;
-
-    return sendmsg(sock, &message_header, 0) >= 0 ? 0 : -1;
-}
-
-__always_inline static inline int ancil_recv_fd(int sock)
-{
-    char nothing = '!';
-    struct iovec nothing_ptr = { .iov_base = &nothing, .iov_len = 1 };
-
-    struct {
-        struct cmsghdr align;
-        int fd[1];
-    } ancillary_data_buffer;
-
-    struct msghdr message_header = {
-            .msg_name = NULL,
-            .msg_namelen = 0,
-            .msg_iov = &nothing_ptr,
-            .msg_iovlen = 1,
-            .msg_flags = 0,
-            .msg_control = &ancillary_data_buffer,
-            .msg_controllen = sizeof(struct cmsghdr) + sizeof(int)
-    };
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&message_header);
-    cmsg->cmsg_len = message_header.msg_controllen;
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    ((int*) CMSG_DATA(cmsg))[0] = -1;
-
-    if (recvmsg(sock, &message_header, 0) < 0) return -1;
-
-    return ((int*) CMSG_DATA(cmsg))[0];
-}

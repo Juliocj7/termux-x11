@@ -22,14 +22,13 @@
 #include <randrstr.h>
 #include <linux/in.h>
 #include <arpa/inet.h>
-#include "renderer.h"
 #include "lorie.h"
 
 #define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
 
 static int argc = 0;
 static char** argv = NULL;
-static int conn_fd = -1;
+__LIBC_HIDDEN__ volatile int conn_fd = -1; // The only variable shared with activity code.
 extern DeviceIntPtr lorieMouse, lorieTouch, lorieKeyboard, loriePen, lorieEraser;
 extern ScreenPtr pScreenPtr;
 extern int ucs2keysym(long ucs);
@@ -42,6 +41,31 @@ static void* startServer(__unused void* cookie) {
     lorieSetVM((JavaVM*) cookie);
     char* envp[] = { NULL };
     exit(dix_main(argc, (char**) argv, envp));
+}
+
+static Bool detectTracer(void)
+{
+    FILE *fp;
+    char  line[256];
+    int pid = 0;
+    Bool detected = FALSE;
+
+    fp = fopen("/proc/self/status", "r");
+    if (!fp)
+        return TRUE;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            sscanf(line+10, "%d", &pid);
+            break;
+        }
+    }
+
+    if (pid != 0)
+        log(INFO, "Tracer detected");
+
+    fclose(fp);
+    return pid != 0;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -80,7 +104,11 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
         execlp("logcat", "logcat", "--pid", pid, NULL);
     }
 
-    if (access("/data/data/com.termux/files/usr/lib/libtermux-exec.so", F_OK) == 0)
+    // No matter what tracer is attached.
+    // In the case of gdb or lldb LD_PRELOAD is already set.
+    // In the case of proot or proot-distro libtermux-exec in LD_PRELOAD will break linking.
+    if (access("/data/data/com.termux/files/usr/lib/libtermux-exec.so", F_OK) == 0 && !detectTracer()
+            && !getenv("XSTARTUP_LD_PRELOAD"))
         setenv("LD_PRELOAD", "/data/data/com.termux/files/usr/lib/libtermux-exec.so", 1);
 
     // adb sets TMPDIR to /data/local/tmp which is pretty useless.
@@ -176,8 +204,9 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
 
 JNIEXPORT void JNICALL
 Java_com_termux_x11_CmdEntryPoint_windowChanged(JNIEnv *env, __unused jobject cls, jobject surface) {
-    QueueWorkProc(lorieChangeWindow, NULL, surface ? (*env)->NewGlobalRef(env, surface) : NULL);
-    lorieTriggerWorkingQueue();
+#if !RENDERER_IN_ACTIVITY
+    renderer_set_window(env, surface ? (*env)->NewGlobalRef(env, surface) : NULL);
+#endif
 }
 
 static Bool sendConfigureNotify(__unused ClientPtr pClient, void *closure) {
@@ -381,6 +410,10 @@ void lorieRequestClipboard(void) {
     }
 }
 
+bool lorieConnectionAlive(void) {
+    return conn_fd != -1;
+}
+
 static Bool addFd(__unused ClientPtr pClient, void *closure) {
     InputThreadRegisterDev((int) (int64_t) closure, handleLorieEvents, NULL);
     conn_fd = (int) (int64_t) closure;
@@ -396,18 +429,11 @@ void lorieSendSharedServerState(int memfd) {
     }
 }
 
-void lorieSendRootWindowBuffer(AHardwareBuffer* buffer) {
+void lorieSendRootWindowBuffer(LorieBuffer* buffer) {
     if (conn_fd != -1 && buffer) {
         lorieEvent e = { .type = EVENT_SHARED_ROOT_WINDOW_BUFFER };
         write(conn_fd, &e, sizeof(e));
-        AHardwareBuffer_sendHandleToUnixSocket(buffer, conn_fd);
-    }
-}
-
-void lorieRequestRender(void) {
-    if (conn_fd != -1) {
-        lorieEvent e = { .type = EVENT_REQUEST_RENDER };
-        write(conn_fd, &e, sizeof(e));
+        LorieBuffer_sendHandleToUnixSocket(buffer, conn_fd);
     }
 }
 
@@ -417,7 +443,6 @@ Java_com_termux_x11_CmdEntryPoint_getXConnection(JNIEnv *env, __unused jobject c
     jclass ParcelFileDescriptorClass = (*env)->FindClass(env, "android/os/ParcelFileDescriptor");
     jmethodID adoptFd = (*env)->GetStaticMethodID(env, ParcelFileDescriptorClass, "adoptFd", "(I)Landroid/os/ParcelFileDescriptor;");
     socketpair(AF_UNIX, SOCK_STREAM, 0, client);
-    fcntl(client[0], F_SETFL, fcntl(client[0], F_GETFL, 0) | O_NONBLOCK);
     QueueWorkProc(addFd, NULL, (void*) (int64_t) client[1]);
     lorieTriggerWorkingQueue();
 
@@ -455,13 +480,11 @@ Java_com_termux_x11_CmdEntryPoint_connected(__unused JNIEnv *env, __unused jclas
 }
 
 JNIEXPORT void JNICALL
-Java_com_termux_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz, jint port, jbyteArray jbytes) {
+Java_com_termux_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz) {
     int server_fd, client, count;
-    struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr = { .s_addr = INADDR_ANY }, .sin_port = htons(port) };
+    struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr = { .s_addr = INADDR_ANY }, .sin_port = htons(PORT) };
     int addrlen = sizeof(address);
     jmethodID sendBroadcast = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, thiz), "sendBroadcast", "()V");
-    jbyte *bytes = (jbyte *)(*env)->GetByteArrayElements(env, jbytes, NULL);
-    size_t size = (*env)->GetArrayLength(env, jbytes);
     uint8_t buffer[512] = {0};
 
     // Even in the case if it will fail for some reason everything will work fine
@@ -494,7 +517,7 @@ Java_com_termux_x11_CmdEntryPoint_listenForConnections(JNIEnv *env, jobject thiz
         }
 
         if ((count = read(client, buffer, sizeof(buffer))) > 0) {
-            if (!memcmp(buffer, bytes, min(count, size))) {
+            if (!memcmp(buffer, MAGIC, min(count, sizeof(MAGIC)))) {
                 log(DEBUG, "New client connection!\n");
                 (*env)->CallVoidMethod(env, thiz, sendBroadcast);
             }
