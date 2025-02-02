@@ -114,14 +114,12 @@ void LorieBuffer_sendHandleToUnixSocket(LorieBuffer* buffer, int socketFd);
  */
 void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuffer** outBuffer);
 
-/**
- * Copy/blit data from one LorieBuffer to another one.
- *
- * @param src
- * @param dst
- * @return
- */
-int LorieBuffer_copy(LorieBuffer* src, LorieBuffer* dst);
+void LorieBuffer_attachToGL(LorieBuffer* buffer);
+void LorieBuffer_bindTexture(LorieBuffer *buffer);
+
+int LorieBuffer_getWidth(LorieBuffer *buffer);
+int LorieBuffer_getHeight(LorieBuffer *buffer);
+bool LorieBuffer_isRgba(LorieBuffer *buffer);
 
 #undef STATIC_INLINE
 

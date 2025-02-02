@@ -24,7 +24,7 @@
 #define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
 #define loge(...) __android_log_print(ANDROID_LOG_ERROR, "gles-renderer", __VA_ARGS__)
 
-static GLuint create_program(const char* p_vertex_source, const char* p_fragment_source);
+static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_source);
 
 static int printEglError(char* msg, int line) {
     char descBuf[32] = {0};
@@ -88,7 +88,7 @@ static void checkGlError(int line) {
 
 #define checkGlError() checkGlError(__LINE__)
 
-static const char vertex_shader[] =
+static const char vertexShaderSrc[] =
     "attribute vec4 position;\n"
     "attribute vec2 texCoords;"
     "varying vec2 outTexCoords;\n"
@@ -105,42 +105,26 @@ static const char vertex_shader[] =
     "   gl_FragColor = texture2D(texture, outTexCoords)" texture ";\n" \
     "}\n"
 
-static const char fragment_shader[] = FRAGMENT_SHADER();
-static const char fragment_shader_bgra[] = FRAGMENT_SHADER(".bgra");
+static const char fragmentShaderSrc[] = FRAGMENT_SHADER();
+static const char fragmentShaderBgraSrc[] = FRAGMENT_SHADER(".bgra");
 
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
 static EGLContext ctx = EGL_NO_CONTEXT;
-static EGLSurface sfc = EGL_NO_SURFACE;
+static EGLSurface defaultSfc = EGL_NO_SURFACE, sfc = EGL_NO_SURFACE;
 static EGLConfig cfg = 0;
-static ANativeWindow* win = 0;
-#if !RENDERER_IN_ACTIVITY
-static jobject surface = NULL;
-#endif
+static ANativeWindow *defaultWin = NULL, *win = NULL;
 static LorieBuffer *buffer = NULL;
-static EGLImageKHR image = NULL;
-
-#if !RENDERER_IN_ACTIVITY
-static jmethodID Surface_release = NULL;
-static jmethodID Surface_destroy = NULL;
-#endif
 
 static JNIEnv* renderEnv = NULL;
 static volatile bool stateChanged = false, bufferChanged = false, windowChanged = false;
 static volatile struct lorie_shared_server_state* pendingState = NULL;
 static volatile LorieBuffer* pendingBuffer = NULL;
-#if RENDERER_IN_ACTIVITY
 static volatile ANativeWindow* pendingWin = NULL;
-#else
-static volatile jobject pendingSurface = NULL;
-#endif
 
 static pthread_mutex_t stateLock;
 static pthread_cond_t stateCond;
+static pthread_cond_t stateChangeFinishCond;
 static volatile struct lorie_shared_server_state* state = NULL;
-static struct {
-    GLuint id;
-    LorieBuffer_Desc desc;
-} display;
 static struct {
     GLuint id;
     bool cursorChanged;
@@ -149,7 +133,7 @@ static struct {
 GLuint g_texture_program = 0, gv_pos = 0, gv_coords = 0;
 GLuint g_texture_program_bgra = 0, gv_pos_bgra = 0, gv_coords_bgra = 0;
 
-static void* renderer_thread(void* closure);
+static void* rendererThread(JNIEnv* env);
 
 static inline __always_inline void bindLinearTexture(GLuint id) {
     glBindTexture(GL_TEXTURE_2D, id);
@@ -173,34 +157,13 @@ const EGLint ctxattribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE
 };
 
-int renderer_init(JNIEnv* env) {
-    JavaVM *vm;
-    pthread_t t;
+int rendererInitThread(JavaVM *vm) {
+    JNIEnv* env;
     EGLint major, minor;
     EGLint numConfigs;
     EGLint *const alphaAttrib = &configAttribs[11];
 
-    if (ctx)
-        return 1;
-
-    (*env)->GetJavaVM(env, &vm);
-
-    pthread_mutex_init(&stateLock, NULL);
-    pthread_cond_init(&stateCond, NULL);
-
-#if !RENDERER_IN_ACTIVITY
-    jclass Surface = (*env)->FindClass(env, "android/view/Surface");
-    Surface_release = (*env)->GetMethodID(env, Surface, "release", "()V");
-    Surface_destroy = (*env)->GetMethodID(env, Surface, "destroy", "()V");
-    if (!Surface_release) {
-        loge("Failed to find required Surface.release method. Aborting.\n");
-        abort();
-    }
-    if (!Surface_destroy) {
-        loge("Failed to find required Surface.destroy method. Aborting.\n");
-        abort();
-    }
-#endif
+    (*vm)->AttachCurrentThread(vm, &env, NULL);
 
     egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (egl_display == EGL_NO_DISPLAY)
@@ -221,14 +184,69 @@ int renderer_init(JNIEnv* env) {
     if (ctx == EGL_NO_CONTEXT)
         return printEglError("eglCreateContext failed", __LINE__);
 
-    if (eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) != EGL_TRUE)
-        return printEglError("eglMakeCurrent failed", __LINE__);
+    // Weird devices without proper EGL_KHR_surfaceless_context support
+    // We can not use pbuffer-based surfaces because it will require searching for configs supporting it
+    // and I am not sure all devices have configs supporting both pbuffers and regular surfaces simultaneously
+    jclass surfaceTextureClass = (*env)->FindClass(env, "android/graphics/SurfaceTexture");
+    jclass surfaceClass = (*env)->FindClass(env, "android/view/Surface");
 
-    pthread_create(&t, NULL, renderer_thread, vm);
+    jmethodID surfaceTextureConstructor = (*env)->GetMethodID(env, surfaceTextureClass, "<init>", "(Z)V");
+    jmethodID surfaceConstructor = (*env)->GetMethodID(env, surfaceClass, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
+
+    jobject surfaceTextureObject = (*env)->NewObject(env, surfaceTextureClass, surfaceTextureConstructor, true);
+    jobject surfaceObject = (*env)->NewObject(env, surfaceClass, surfaceConstructor, surfaceTextureObject);
+
+    // We will use this surfacetexture each time surface is destroyed, zero reasons to clean it up
+    (*env)->NewGlobalRef(env, surfaceTextureObject);
+    (*env)->NewGlobalRef(env, surfaceObject);
+
+    win = defaultWin = ANativeWindow_fromSurface(env, surfaceObject);
+    ANativeWindow_acquire(defaultWin);
+
+    sfc = defaultSfc = eglCreateWindowSurface(egl_display, cfg, win, NULL);
+
+    eglMakeCurrent(egl_display, sfc, sfc, ctx);
+    eglSwapInterval(egl_display, 0);
+
+    g_texture_program = createProgram(vertexShaderSrc, fragmentShaderSrc);
+    if (!g_texture_program)
+        log("Xlorie: GLESv2: Unable to create shader program.\n");
+
+    g_texture_program_bgra = createProgram(vertexShaderSrc, fragmentShaderBgraSrc);
+    if (!g_texture_program_bgra)
+        log("Xlorie: GLESv2: Unable to create bgra shader program.\n");
+
+    gv_pos = (GLuint) glGetAttribLocation(g_texture_program, "position");
+    gv_coords = (GLuint) glGetAttribLocation(g_texture_program, "texCoords");
+
+    gv_pos_bgra = (GLuint) glGetAttribLocation(g_texture_program_bgra, "position");
+    gv_coords_bgra = (GLuint) glGetAttribLocation(g_texture_program_bgra, "texCoords");
+
+    glActiveTexture(GL_TEXTURE0);
+    glGenTextures(1, &cursor.id);
+
+    rendererThread(env);
     return 1;
 }
 
-void renderer_test_capabilities(int* legacy_drawing, uint8_t* flip) {
+int rendererInit(JNIEnv* env) {
+    pthread_t t;
+    JavaVM *vm;
+
+    if (ctx)
+        return 1;
+
+    (*env)->GetJavaVM(env, &vm);
+
+    pthread_mutex_init(&stateLock, NULL);
+    pthread_cond_init(&stateCond, NULL);
+    pthread_cond_init(&stateChangeFinishCond, NULL);
+
+    pthread_create(&t, NULL, (void*(*)(void*)) rendererInitThread, vm);
+    return 1;
+}
+
+void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
     // Some devices do not support sampling from HAL_PIXEL_FORMAT_BGRA_8888, here we are checking it.
     const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
     EGLint numConfigs;
@@ -338,7 +356,7 @@ void renderer_test_capabilities(int* legacy_drawing, uint8_t* flip) {
     }
 }
 
-__unused void renderer_set_shared_state(struct lorie_shared_server_state* newState) {
+__unused void rendererSetSharedState(struct lorie_shared_server_state* newState) {
     pthread_mutex_lock(&stateLock);
     if (newState == pendingState || newState == state)
         goto end;
@@ -357,14 +375,8 @@ __unused void renderer_set_shared_state(struct lorie_shared_server_state* newSta
     end: pthread_mutex_unlock(&stateLock);
 }
 
-void renderer_set_buffer(LorieBuffer* buf) {
+void rendererSetBuffer(LorieBuffer* buf) {
     pthread_mutex_lock(&stateLock);
-    if (buf == pendingBuffer)
-        goto end;
-
-    if (pendingBuffer)
-        LorieBuffer_release(pendingBuffer);
-
     pendingBuffer = buf;
     bufferChanged = true;
 
@@ -376,16 +388,14 @@ void renderer_set_buffer(LorieBuffer* buf) {
         pthread_cond_signal(&state->cond);
     pthread_cond_signal(&stateCond);
 
-    end: pthread_mutex_unlock(&stateLock);
+    while(bufferChanged)
+        pthread_cond_wait(&stateChangeFinishCond, &stateLock);
+
+    pthread_mutex_unlock(&stateLock);
 }
 
-#if RENDERER_IN_ACTIVITY
-void renderer_set_window(ANativeWindow* newWin) {
-#else
-void renderer_set_window(JNIEnv* env, jobject new_surface) {
-#endif
+void rendererSetWindow(ANativeWindow* newWin) {
     pthread_mutex_lock(&stateLock);
-#if RENDERER_IN_ACTIVITY
     if (newWin && pendingWin == newWin) {
         ANativeWindow_release(newWin);
         pthread_mutex_unlock(&stateLock);
@@ -396,23 +406,6 @@ void renderer_set_window(JNIEnv* env, jobject new_surface) {
         ANativeWindow_release(pendingWin);
 
     pendingWin = newWin;
-#else
-    if (pendingSurface && new_surface && pendingSurface != new_surface && (*env)->IsSameObject(env, pendingSurface, new_surface)) {
-        (*env)->DeleteGlobalRef(env, new_surface);
-        pthread_mutex_unlock(&stateLock);
-        return;
-    }
-
-    if (pendingSurface && pendingSurface == new_surface) {
-        pthread_mutex_unlock(&stateLock);
-        return;
-    }
-
-    if (pendingSurface)
-        (*env)->DeleteGlobalRef(env, pendingSurface);
-
-    pendingSurface = new_surface;
-#endif
     windowChanged = TRUE;
 
     // We are not sure which conditional variable is used at current moment so let's signal both
@@ -420,81 +413,53 @@ void renderer_set_window(JNIEnv* env, jobject new_surface) {
         pthread_cond_signal(&state->cond);
     pthread_cond_signal(&stateCond);
 
+    // We should wait until renderer destroys EGLSurface before SurfaceCallback::surfaceDestroyed finishes
+    // Otherwise we will have weird errors like
+    // `freeAllBuffers: 1 buffers were freed while being dequeued!`
+    // or
+    // `query: BufferQueue has been abandoned`
+    while(windowChanged)
+        pthread_cond_wait(&stateChangeFinishCond, &stateLock);
+
     pthread_mutex_unlock(&stateLock);
 }
 
-#if RENDERER_IN_ACTIVITY
-static inline __always_inline void release_win_and_surface(JNIEnv *env, ANativeWindow** anw, EGLSurface *esfc) {
-#else
-static inline __always_inline void release_win_and_surface(JNIEnv *env, jobject* jsfc, ANativeWindow** anw, EGLSurface *esfc) {
-#endif
-    if (esfc && *esfc) {
-        if (eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) != EGL_TRUE)
+static inline __always_inline void releaseWinAndSurface(JNIEnv *env, ANativeWindow** anw, EGLSurface *esfc) {
+    if (esfc && *esfc && *esfc != defaultSfc) {
+        // Requeue the dequeued buffer, causes flickering during window reconfiguring
+        eglSwapBuffers(egl_display, *esfc);
+        if (eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx) != EGL_TRUE)
             return vprintEglError("eglMakeCurrent failed (EGL_NO_SURFACE)", __LINE__);
         if (eglDestroySurface(egl_display, *esfc) != EGL_TRUE)
             return vprintEglError("eglDestoySurface failed", __LINE__);
-        *esfc = EGL_NO_SURFACE;
+        *esfc = defaultSfc;
     }
 
-    if (anw && *anw) {
+    if (anw && *anw && *anw != defaultWin) {
         ANativeWindow_release(*anw);
-        *anw = NULL;
+        *anw = defaultWin;
     }
-
-#if !RENDERER_IN_ACTIVITY
-    if (jsfc && *jsfc) {
-        (*env)->CallVoidMethod(env, *jsfc, Surface_release);
-        (*env)->CallVoidMethod(env, *jsfc, Surface_destroy);
-        (*env)->DeleteGlobalRef(env, *jsfc);
-        *jsfc = NULL;
-    }
-#endif
 }
 
-void renderer_refresh_context(JNIEnv* env) {
-    uint32_t emptyData = {0};
-#if !RENDERER_IN_ACTIVITY
-    ANativeWindow* pendingWin = pendingSurface ? ANativeWindow_fromSurface(env, pendingSurface) : NULL;
-    if ((pendingSurface && surface && pendingSurface != surface && (*env)->IsSameObject(env, pendingSurface, surface)) || (pendingWin && win == pendingWin)) {
-        (*env)->DeleteGlobalRef(env, pendingSurface);
-        pendingSurface = NULL;
-        windowChanged = FALSE;
-        return;
-    }
-#endif
+void rendererRefreshContext(JNIEnv* env) {
     int width = pendingWin ? ANativeWindow_getWidth(pendingWin) : 0;
     int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
-    log("renderer_set_window %p %d %d", pendingWin, width, height);
+    log("rendererSetWindow %p %d %d", pendingWin, width, height);
 
-#if RENDERER_IN_ACTIVITY
-    release_win_and_surface(env, &win, &sfc);
-#else
-    if (pendingWin)
-        ANativeWindow_acquire(pendingWin);
-
-    release_win_and_surface(env, &surface, &win, &sfc);
-#endif
+    releaseWinAndSurface(env, &win, &sfc);
 
     if (pendingWin && (width <= 0 || height <= 0)) {
         log("Xlorie: We've got invalid surface. Probably it became invalid before we started working with it.\n");
-#if RENDERER_IN_ACTIVITY
-        release_win_and_surface(env, &pendingWin, NULL);
-#else
-        release_win_and_surface(env, &pendingSurface, &pendingWin, NULL);
-#endif
+        releaseWinAndSurface(env, &pendingWin, NULL);
     }
 
     win = pendingWin;
-#if RENDERER_IN_ACTIVITY
     pendingWin = NULL;
-#else
-    surface = pendingSurface;
-    pendingSurface = NULL;
-#endif
     windowChanged = FALSE;
 
     if (!win) {
-        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        win = defaultWin;
+        eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx);
         if (state)
             state->surfaceAvailable = false;
         return;
@@ -512,145 +477,82 @@ void renderer_refresh_context(JNIEnv* env) {
 
     eglSwapInterval(egl_display, 0);
 
+    // We should redraw image at least once right after surface change
     if (state)
-        // We should redraw image at least once right after surface change
-        state->surfaceAvailable = state->drawRequested = state->cursor.updated = true;
-
-    if (!g_texture_program) {
-        g_texture_program = create_program(vertex_shader, fragment_shader);
-        if (!g_texture_program) {
-            log("Xlorie: GLESv2: Unable to create shader program.\n");
-            return;
-        }
-
-        g_texture_program_bgra = create_program(vertex_shader, fragment_shader_bgra);
-        if (!g_texture_program_bgra) {
-            log("Xlorie: GLESv2: Unable to create bgra shader program.\n");
-            return;
-        }
-
-        gv_pos = (GLuint) glGetAttribLocation(g_texture_program, "position");
-        gv_coords = (GLuint) glGetAttribLocation(g_texture_program, "texCoords");
-
-        gv_pos_bgra = (GLuint) glGetAttribLocation(g_texture_program_bgra, "position");
-        gv_coords_bgra = (GLuint) glGetAttribLocation(g_texture_program_bgra, "texCoords");
-
-        glActiveTexture(GL_TEXTURE0);
-        glGenTextures(1, &display.id);
-        glGenTextures(1, &cursor.id);
-    }
+        state->surfaceAvailable = state->drawRequested = state->cursor.updated = win != defaultWin;
 
     glViewport(0, 0, ANativeWindow_getWidth(win), ANativeWindow_getHeight(win));
     log("Xlorie: new surface applied: %p\n", sfc);
-
-    bindLinearTexture(display.id);
-    if (image)
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
-    else {
-        LorieBuffer_describe(buffer, &display.desc);
-
-        if (display.desc.data && display.desc.width > 0 && display.desc.height > 0) {
-            int format = display.desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA;
-            // The image will be updated in redraw call because of `drawRequested` flag, so we are not uploading pixels
-            glTexImage2D(GL_TEXTURE_2D, 0, format, display.desc.width, display.desc.height, 0, format, GL_UNSIGNED_BYTE, NULL);
-        } else
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &emptyData);
-    }
 }
 
 static void draw(GLuint id, float x0, float y0, float x1, float y1, uint8_t flip);
-static void draw_cursor(void);
+static void drawCursor(float displayWidth, float displayHeight);
 
-static void renderer_renew_image(void) {
+static void rendererRenewImage(void) {
     const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
-    uint32_t emptyData = {0};
-
-    if (image)
-        eglDestroyImageKHR(egl_display, image);
     if (buffer)
         LorieBuffer_release(buffer);
 
     buffer = pendingBuffer;
     pendingBuffer = NULL;
     bufferChanged = false;
-    image = NULL;
 
-    LorieBuffer_describe(buffer, &display.desc);
+    LorieBuffer_attachToGL(buffer);
+    log("renderer: buffer changed %p %d %d", buffer, (int) LorieBuffer_getWidth(buffer), (int) LorieBuffer_getHeight(buffer));
 
-    if (display.desc.buffer)
-        image = eglCreateImageKHR(egl_display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, eglGetNativeClientBufferANDROID(display.desc.buffer), imageAttributes);
-
-    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
-        if (state)
-            // We should redraw image at least once right after buffer change
-            state->surfaceAvailable = state->drawRequested = state->cursor.updated = true;
-
-        bindLinearTexture(display.id);
-        if (image)
-            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
-        else if (display.desc.data && display.desc.width > 0 && display.desc.height > 0) {
-            int format = display.desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA;
-            // The image will be updated in redraw call because of `drawRequested` flag, so we are not uploading pixels
-            glTexImage2D(GL_TEXTURE_2D, 0, format, display.desc.width, display.desc.height, 0, format, GL_UNSIGNED_BYTE, NULL);
-        } else {
-            loge("There is no %s, nothing to be bound.", !buffer ? "AHardwareBuffer" : "EGLImage");
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &emptyData);
-        }
-    }
-
-    log("renderer: buffer changed %p %d %d", buffer, display.desc.width, display.desc.height);
+    // We should redraw image at least once right after buffer change
+    if (state)
+        state->surfaceAvailable = state->drawRequested = state->cursor.updated = win != defaultWin;
 }
 
-int renderer_redraw_locked(JNIEnv* env) {
-    int err = EGL_SUCCESS;
+void rendererRedrawLocked(JNIEnv* env) {
+    EGLSync fence;
 
-    // We should signal X server to not use root window or change cursor while we actively use them
-    lorie_mutex_lock(&state->lock);
-    // Non-null display.desc.data means we have root window created in legacy drawing mode so we should update it on each frame.
-    if (display.desc.data && state->drawRequested) {
-        state->drawRequested = FALSE;
-        bindLinearTexture(display.id);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, display.desc.width, display.desc.height, display.desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, display.desc.data);
-    }
-
-    // Not a mistake, we reset drawRequested flag even in the case if there is no legacy drawing.
+    // We should signal X server to not use root window while we actively copy it
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
     state->drawRequested = FALSE;
-    draw(display.id,  -1.f, -1.f, 1.f, 1.f, display.desc.format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM);
+
+    LorieBuffer_bindTexture(buffer);
+    draw(0,  -1.f, -1.f, 1.f, 1.f, LorieBuffer_isRgba(buffer));
+    fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+    glFlush();
 
     if (state->cursor.updated) {
         log("Xlorie: updating cursor\n");
-        lorie_mutex_lock(&state->cursor.lock);
+        lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
         state->cursor.updated = false;
         bindLinearTexture(cursor.id);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, state->cursor.bits);
-        lorie_mutex_unlock(&state->cursor.lock);
+        lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
     }
 
     state->cursor.moved = FALSE;
-    draw_cursor();
-    if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE) {
-        printEglError("Failed to swap buffers", __LINE__);
-        err = eglGetError();
-        if (err == EGL_BAD_NATIVE_WINDOW || err == EGL_BAD_SURFACE) {
-            log("The window is to be destroyed. Native window disconnected/abandoned, probably activity is destroyed or in background");
-#if RENDERER_IN_ACTIVITY
-            renderer_set_window(NULL);
-#else
-            renderer_set_window(env, NULL);
-#endif
-            lorie_mutex_unlock(&state->lock);
-            return FALSE;
-        }
-    }
-    lorie_mutex_unlock(&state->lock);
+    drawCursor((float) (LorieBuffer_getWidth(buffer)), (float) (LorieBuffer_getHeight(buffer)));
+    glFlush();
 
+    // Wait until root window drawing is finished before giving control back to X server
+    eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+    eglDestroySyncKHR(egl_display, fence);
     state->waitForNextFrame = true;
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+
+    if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
+        printEglError("Failed to swap buffers", __LINE__);
+
+    // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 1, 1);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+    eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+    eglDestroySyncKHR(egl_display, fence);
 
     state->renderedFrames++;
-    return TRUE;
 }
 
-static inline __always_inline bool renderer_should_wait(void) {
+static inline __always_inline bool rendererShouldWait(void) {
     if (stateChanged || windowChanged || bufferChanged)
         // If there are pending changes we should process them immediately.
         return false;
@@ -667,16 +569,18 @@ static inline __always_inline bool renderer_should_wait(void) {
     return true;
 }
 
-__noreturn static void* renderer_thread(void* closure) {
-    JavaVM* vm = closure;
-    JNIEnv* env;
-    (*vm)->AttachCurrentThread(vm, &env, NULL);
+__noreturn static void* rendererThread(JNIEnv* env) {
+    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_init(&m, NULL);
+    // Mutex is needed only for pthread_cond_wait, it is needed only to make thread sleep when it is idle.
+    // We check for all event that may change in between so we should not miss any events.
+    pthread_mutex_lock(&m);
 
-    pthread_mutex_lock(&stateLock);
     while (true) {
-        while (renderer_should_wait())
-            pthread_cond_wait(state ? &state->cond : &stateCond, &stateLock);
+        while (rendererShouldWait())
+            pthread_cond_wait(state ? &state->cond : &stateCond, &m);
 
+        pthread_mutex_lock(&stateLock);
         if (stateChanged) {
             if (state && pendingState != state)
                 munmap(state, sizeof(*state));
@@ -684,21 +588,31 @@ __noreturn static void* renderer_thread(void* closure) {
             state = pendingState;
             pendingState = NULL;
             stateChanged = false;
+
+            if (state)
+                state->surfaceAvailable = win != defaultWin;
+            else if (win != defaultWin) {
+                glClearColor(0, 0, 0, 0);
+                glClear(GL_COLOR_BUFFER_BIT);
+                eglSwapBuffers(egl_display, sfc);
+            }
         }
 
         if (windowChanged)
-            renderer_refresh_context(env);
+            rendererRefreshContext(env);
 
         if (bufferChanged)
-            renderer_renew_image();
+            rendererRenewImage();
+
+        pthread_cond_signal(&stateChangeFinishCond);
+        pthread_mutex_unlock(&stateLock);
 
         if (state && state->surfaceAvailable && !state->waitForNextFrame && (state->drawRequested || state->cursor.moved || state->cursor.updated))
-            renderer_redraw_locked(env);
+            rendererRedrawLocked(env);
     }
-    pthread_mutex_unlock(&stateLock);
 }
 
-static GLuint load_shader(GLenum shaderType, const char* pSource) {
+static GLuint loadShader(GLenum shaderType, const char* pSource) {
     GLint compiled = 0, infoLen = 0;
     GLuint shader = glCreateShader(shaderType);
     if (!shader)
@@ -721,11 +635,11 @@ static GLuint load_shader(GLenum shaderType, const char* pSource) {
     return 0;
 }
 
-static GLuint create_program(const char* p_vertex_source, const char* p_fragment_source) {
+static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_source) {
     GLuint program, vertexShader, pixelShader;
     GLint linkStatus = GL_FALSE, bufLength = 0;
-    vertexShader = load_shader(GL_VERTEX_SHADER, p_vertex_source);
-    pixelShader = load_shader(GL_FRAGMENT_SHADER, p_fragment_source);
+    vertexShader = loadShader(GL_VERTEX_SHADER, p_vertex_source);
+    pixelShader = loadShader(GL_FRAGMENT_SHADER, p_fragment_source);
     if (!pixelShader || !vertexShader) {
         return 0;
     }
@@ -764,7 +678,8 @@ static void draw(GLuint id, float x0, float y0, float x1, float y1, uint8_t flip
 
     glActiveTexture(GL_TEXTURE0);
     glUseProgram(flip ? g_texture_program_bgra : g_texture_program);
-    glBindTexture(GL_TEXTURE_2D, id);
+    if (id)
+        glBindTexture(GL_TEXTURE_2D, id);
 
     glVertexAttribPointer(p, 2, GL_FLOAT, GL_FALSE, 16, coords);
     glVertexAttribPointer(c, 2, GL_FLOAT, GL_FALSE, 16, &coords[2]);
@@ -773,16 +688,16 @@ static void draw(GLuint id, float x0, float y0, float x1, float y1, uint8_t flip
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); checkGlError();
 }
 
-__unused static void draw_cursor(void) {
+__unused static void drawCursor(float displayWidth, float displayHeight) {
     float x, y, w, h;
 
     if (!state->cursor.width || !state->cursor.height)
         return;
 
-    x = 2.f * ((float) state->cursor.x - (float) state->cursor.xhot) / (float) display.desc.width - 1.f;
-    y = 2.f * ((float) state->cursor.y - (float) state->cursor.yhot) / (float) display.desc.height - 1.f;
-    w = 2.f * (float) state->cursor.width / (float) display.desc.width;
-    h = 2.f * (float) state->cursor.height / (float) display.desc.height;
+    x = 2.f * ((float) state->cursor.x - (float) state->cursor.xhot) / displayWidth - 1.f;
+    y = 2.f * ((float) state->cursor.y - (float) state->cursor.yhot) / displayHeight - 1.f;
+    w = 2.f * (float) state->cursor.width / displayWidth;
+    h = 2.f * (float) state->cursor.height / displayHeight;
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     draw(cursor.id, x, y, x + w, y + h, false);

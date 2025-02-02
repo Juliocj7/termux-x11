@@ -45,8 +45,8 @@ import android.view.PointerIcon;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.Window;
-import android.view.WindowInsets;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -73,7 +73,7 @@ import java.util.Map;
 
 @SuppressLint("ApplySharedPref")
 @SuppressWarnings({"deprecation", "unused"})
-public class MainActivity extends AppCompatActivity implements View.OnApplyWindowInsetsListener {
+public class MainActivity extends AppCompatActivity {
     public static final String ACTION_STOP = "com.termux.x11.ACTION_STOP";
     public static final String ACTION_CUSTOM = "com.termux.x11.ACTION_CUSTOM";
 
@@ -118,8 +118,17 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
                     onPreferencesChanged("");
             } else if (ACTION_CUSTOM.equals(intent.getAction())) {
                 android.util.Log.d("ACTION_CUSTOM", "action " + intent.getStringExtra("what"));
-                mInputHandler.extractUserActionFromPreferences(prefs, intent.getStringExtra("what")).accept(true);
+                mInputHandler.extractUserActionFromPreferences(prefs, intent.getStringExtra("what")).accept(0, true);
             }
+        }
+    };
+
+    ViewTreeObserver.OnPreDrawListener mOnPredrawListener = new ViewTreeObserver.OnPreDrawListener() {
+        @Override
+        public boolean onPreDraw() {
+            if (LorieView.connected())
+                handler.post(() -> findViewById(android.R.id.content).getViewTreeObserver().removeOnPreDrawListener(mOnPredrawListener));
+            return false;
         }
     };
 
@@ -177,14 +186,21 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
             return result;
         };
 
-        lorieParent.setOnTouchListener((v, e) -> mInputHandler.handleTouchEvent(lorieParent, lorieView, e));
+        lorieParent.setOnTouchListener((v, e) -> {
+            // Avoid batched MotionEvent objects and reduce potential latency.
+            // For reference: https://developer.android.com/develop/ui/views/touch-and-input/stylus-input/advanced-stylus-features#rendering.
+            if (e.getAction() == MotionEvent.ACTION_DOWN)
+                lorieParent.requestUnbufferedDispatch(e);
+
+            return mInputHandler.handleTouchEvent(lorieParent, lorieView, e);
+        });
         lorieParent.setOnHoverListener((v, e) -> mInputHandler.handleTouchEvent(lorieParent, lorieView, e));
         lorieParent.setOnGenericMotionListener((v, e) -> mInputHandler.handleTouchEvent(lorieParent, lorieView, e));
         lorieView.setOnCapturedPointerListener((v, e) -> mInputHandler.handleTouchEvent(lorieView, lorieView, e));
         lorieParent.setOnCapturedPointerListener((v, e) -> mInputHandler.handleTouchEvent(lorieView, lorieView, e));
         lorieView.setOnKeyListener(mLorieKeyListener);
 
-        lorieView.setCallback((sfc, surfaceWidth, surfaceHeight, screenWidth, screenHeight) -> {
+        lorieView.setCallback((surfaceWidth, surfaceHeight, screenWidth, screenHeight) -> {
             String name;
             int framerate = (int) ((lorieView.getDisplay() != null) ? lorieView.getDisplay().getRefreshRate() : 30);
 
@@ -197,14 +213,6 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
             else
                 name = "External Display";
             LorieView.sendWindowChange(screenWidth, screenHeight, framerate, name);
-
-            if (service != null && !LorieView.renderingInActivity()) {
-                try {
-                    service.windowChanged(sfc);
-                } catch (RemoteException e) {
-                    Log.e("MainActivity", "failed to send windowChanged request", e);
-                }
-            }
         });
 
         registerReceiver(receiver, new IntentFilter(ACTION_START) {{
@@ -221,7 +229,11 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         mNotification = buildNotification();
         mNotificationManager.notify(mNotificationId, mNotification);
 
-        tryConnect();
+        if (tryConnect()) {
+            final View content = findViewById(android.R.id.content);
+            content.getViewTreeObserver().addOnPreDrawListener(mOnPredrawListener);
+            handler.postDelayed(() -> content.getViewTreeObserver().removeOnPreDrawListener(mOnPredrawListener), 500);
+        }
         onPreferencesChanged("");
 
         toggleExtraKeys(false, false);
@@ -249,6 +261,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     //Register the needed events to handle stylus as left, middle and right click
     @SuppressLint("ClickableViewAccessibility")
     private void initStylusAuxButtons() {
+        final ViewPager pager = getTerminalToolbarViewPager();
         boolean stylusMenuEnabled = prefs.showStylusClickOverride.get() && LorieView.connected();
         final float menuUnselectedTrasparency = 0.66f;
         final float menuSelectedTrasparency = 1.0f;
@@ -289,6 +302,8 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
                 //Calculate screen border making sure btn is fully inside the view
                 float maxX = frm.getWidth() - 4 * left.getWidth();
                 float maxY = frm.getHeight() - 4 * left.getHeight();
+                if (pager.getVisibility() == View.VISIBLE)
+                    maxY -= pager.getHeight();
 
                 //Make sure the Stylus menu is fully inside the screen
                 overlay.setX(MathUtils.clamp(overlay.getX(), 0, maxX));
@@ -311,6 +326,8 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
                 //Calculate screen border making sure btn is fully inside the view
                 float maxX = frm.getWidth() - visibility.getWidth();
                 float maxY = frm.getHeight() - visibility.getHeight();
+                if (pager.getVisibility() == View.VISIBLE)
+                    maxY -= pager.getHeight();
 
                 switch (event.getAction()) {
                     case DragEvent.ACTION_DRAG_LOCATION:
@@ -354,23 +371,16 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
     }
 
     private void makeSureHelpersAreVisibleAndInScreenBounds() {
-        int[] offset = new int[2];
-        int[] offset2 = new int[2];
+        final ViewPager pager = getTerminalToolbarViewPager();
         View mouseAuxButtons = findViewById(R.id.mouse_buttons);
         View stylusAuxButtons = findViewById(R.id.mouse_helper_visibility);
-        frm.getLocationInWindow(offset2);
+        int maxYDecrement = (pager.getVisibility() == View.VISIBLE) ? pager.getHeight() : 0;
 
-        if (mouseAuxButtons.getVisibility() == View.VISIBLE) {
-            mouseAuxButtons.getLocationInWindow(offset);
-            mouseAuxButtons.setX(MathUtils.clamp(offset[0], offset2[0], offset2[0] + frm.getWidth() - mouseAuxButtons.getWidth()));
-            mouseAuxButtons.setY(MathUtils.clamp(offset[1], offset2[1], offset2[1] + frm.getHeight() - mouseAuxButtons.getHeight()));
-        }
+        mouseAuxButtons.setX(MathUtils.clamp(mouseAuxButtons.getX(), frm.getX(), frm.getX() + frm.getWidth() - mouseAuxButtons.getWidth()));
+        mouseAuxButtons.setY(MathUtils.clamp(mouseAuxButtons.getY(), frm.getY(), frm.getY() + frm.getHeight() - mouseAuxButtons.getHeight() - maxYDecrement));
 
-        if (stylusAuxButtons.getVisibility() == View.VISIBLE) {
-            stylusAuxButtons.getLocationInWindow(offset);
-            stylusAuxButtons.setX(MathUtils.clamp(offset[0], offset2[0], offset2[0] + frm.getWidth() - stylusAuxButtons.getWidth()));
-            stylusAuxButtons.setY(MathUtils.clamp(offset[1], offset2[1], offset2[1] + frm.getHeight() - stylusAuxButtons.getHeight()));
-        }
+        stylusAuxButtons.setX(MathUtils.clamp(stylusAuxButtons.getX(), frm.getX(), frm.getX() + frm.getWidth() - stylusAuxButtons.getWidth()));
+        stylusAuxButtons.setY(MathUtils.clamp(stylusAuxButtons.getY(), frm.getY(), frm.getY() + frm.getHeight() - stylusAuxButtons.getHeight() - maxYDecrement));
     }
 
     public void toggleStylusAuxButtons() {
@@ -400,6 +410,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
 
     @SuppressLint("ClickableViewAccessibility")
     void initMouseAuxButtons() {
+        final ViewPager pager = getTerminalToolbarViewPager();
         Button left = findViewById(R.id.mouse_button_left_click);
         Button right = findViewById(R.id.mouse_button_right_click);
         Button middle = findViewById(R.id.mouse_button_middle_click);
@@ -421,10 +432,12 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
                 secondaryLayer.setOrientation(LinearLayout.HORIZONTAL);
             }
             handler.postDelayed(() -> {
-                int[] offset = new int[2];
-                frm.getLocationInWindow(offset);
-                primaryLayer.setX(MathUtils.clamp(primaryLayer.getX(), offset[0], offset[0] + frm.getWidth() - primaryLayer.getWidth()));
-                primaryLayer.setY(MathUtils.clamp(primaryLayer.getY(), offset[1], offset[1] + frm.getHeight() - primaryLayer.getHeight()));
+                float maxX = frm.getX() + frm.getWidth() - primaryLayer.getWidth();
+                float maxY = frm.getY() + frm.getHeight() - primaryLayer.getHeight();
+                if (pager.getVisibility() == View.VISIBLE)
+                    maxY -= pager.getHeight();
+                primaryLayer.setX(MathUtils.clamp(primaryLayer.getX(), frm.getX(), maxX));
+                primaryLayer.setY(MathUtils.clamp(primaryLayer.getY(), frm.getY(), maxY));
             }, 10);
         });
 
@@ -462,12 +475,16 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
                         pos.setPressed(true);
                         break;
                     case MotionEvent.ACTION_MOVE: {
+                        final ViewPager pager = getTerminalToolbarViewPager();
                         int[] offset = new int[2];
-                        int[] offset2 = new int[2];
                         primaryLayer.getLocationInWindow(offset);
-                        frm.getLocationInWindow(offset2);
-                        primaryLayer.setX(MathUtils.clamp(offset[0] - startOffset[0] + e.getX(), offset2[0], offset2[0] + frm.getWidth() - primaryLayer.getWidth()));
-                        primaryLayer.setY(MathUtils.clamp(offset[1] - startOffset[1] + e.getY(), offset2[1], offset2[1] + frm.getHeight() - primaryLayer.getHeight()));
+                        float maxX = frm.getX() + frm.getWidth() - primaryLayer.getWidth();
+                        float maxY = frm.getY() + frm.getHeight() - primaryLayer.getHeight();
+                        if (pager.getVisibility() == View.VISIBLE)
+                            maxY -= pager.getHeight();
+
+                        primaryLayer.setX(MathUtils.clamp(offset[0] - startOffset[0] + e.getX(), frm.getX(), maxX));
+                        primaryLayer.setY(MathUtils.clamp(offset[1] - startOffset[1] + e.getY(), frm.getY(), maxY));
                         break;
                     }
                     case MotionEvent.ACTION_UP: {
@@ -522,14 +539,14 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         }
     }
 
-    void tryConnect() {
+    boolean tryConnect() {
         if (LorieView.connected())
-            return;
+            return false;
 
         if (service == null) {
-            LorieView.requestConnection();
+            boolean sent = LorieView.requestConnection();
             handler.postDelayed(this::tryConnect, 250);
-            return;
+            return true;
         }
 
         try {
@@ -546,10 +563,9 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
             Log.e("MainActivity", "Something went wrong while we were establishing connection", e);
             service = null;
 
-            // We should reset the View for the case if we have sent it's surface to the client.
-            getLorieView().regenerate();
             handler.postDelayed(this::tryConnect, 250);
         }
+        return false;
     }
 
     void onPreferencesChanged(String key) {
@@ -665,6 +681,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
             prefs.additionalKbdVisible.put(visible);
 
         setTerminalToolbarView();
+        getWindow().setSoftInputMode(prefs.Reseed.get() ? SOFT_INPUT_ADJUST_RESIZE : SOFT_INPUT_ADJUST_PAN);
     }
 
     public void toggleExtraKeys() {
@@ -785,7 +802,7 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         else
             window.clearFlags(FLAG_KEEP_SCREEN_ON);
 
-        window.setSoftInputMode((reseed ? SOFT_INPUT_ADJUST_RESIZE : SOFT_INPUT_ADJUST_PAN) | SOFT_INPUT_STATE_HIDDEN);
+        window.setSoftInputMode(reseed ? SOFT_INPUT_ADJUST_RESIZE : SOFT_INPUT_ADJUST_PAN);
 
         ((FrameLayout) findViewById(android.R.id.content)).getChildAt(0).setFitsSystemWindows(!fullscreen);
     }
@@ -822,14 +839,6 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig);
     }
 
-    /** @noinspection NullableProblems*/
-    @SuppressLint("WrongConstant")
-    @Override
-    public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-        handler.postDelayed(() -> getLorieView().triggerCallback(), 100);
-        return insets;
-    }
-
     /**
      * Manually toggle soft keyboard visibility
      * @param context calling context
@@ -855,13 +864,14 @@ public class MainActivity extends AppCompatActivity implements View.OnApplyWindo
             findViewById(R.id.mouse_buttons).setVisibility(prefs.showMouseHelper.get() && "1".equals(prefs.touchMode.get()) && connected ? View.VISIBLE : View.GONE);
             findViewById(R.id.stub).setVisibility(connected?View.INVISIBLE:View.VISIBLE);
             getLorieView().setVisibility(connected?View.VISIBLE:View.INVISIBLE);
-            getLorieView().regenerate();
 
             // We should recover connection in the case if file descriptor for some reason was broken...
             if (!connected)
                 tryConnect();
             else
                 getLorieView().setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
+
+            onWindowFocusChanged(hasWindowFocus());
         });
     }
 
