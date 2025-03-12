@@ -89,6 +89,7 @@ static jboolean requestConnection(__unused JNIEnv *env, __unused jclass clazz) {
         check(r < 0, "poll failed: %s", strerror(errno));
         socklen_t len = sizeof(so_error);
         check(getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0, "getsockopt failed: %s", strerror(errno));
+        if (so_error == ECONNREFUSED) goto end; // Regular situation which happens often if server is not started. No need to spam logcat with this.
         check(so_error != 0, "Connection failed: %s", strerror(so_error));
 
         check(write(sock, MAGIC, sizeof(MAGIC)) < 0, "failed to send message: %s", strerror(errno));
@@ -139,7 +140,7 @@ static int xcallback(int fd, int events, __unused void* data) {
         close(conn_fd);
         conn_fd = -1;
         rendererSetSharedState(NULL);
-        rendererSetBuffer(NULL);
+        rendererRemoveAllBuffers();
         log(DEBUG, "disconnected");
         return 1;
     }
@@ -190,14 +191,17 @@ static int xcallback(int fd, int events, __unused void* data) {
                     close(stateFd); // Closing file descriptor does not unmmap shared memory fragment.
                     break;
                 }
-                case EVENT_SHARED_ROOT_WINDOW_BUFFER: {
+                case EVENT_ADD_BUFFER: {
                     static LorieBuffer* buffer = NULL;
-                    LorieBuffer_Desc desc = {0};
+                    const LorieBuffer_Desc* desc;
                     LorieBuffer_recvHandleFromUnixSocket(conn_fd, &buffer);
-                    LorieBuffer_describe(buffer, &desc);
-                    log(INFO, "Received shared buffer width %d height %d format %d", desc.width, desc.height, desc.format);
-                    rendererSetBuffer(buffer);
-                    LorieBuffer_release(buffer);
+                    desc = LorieBuffer_description(buffer);
+                    log(INFO, "Received shared buffer width %d stride %d height %d format %d type %d id %llu", desc->width, desc->stride, desc->height, desc->format, desc->type, desc->id);
+                    rendererAddBuffer(buffer);
+                    break;
+                }
+                case EVENT_REMOVE_BUFFER: {
+                    rendererRemoveBuffer(e.removeBuffer.id);
                     break;
                 }
             }
@@ -215,6 +219,9 @@ static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd) {
     if (conn_fd != -1) {
         ALooper_removeFd(ALooper_forThread(), conn_fd);
         close(conn_fd);
+        rendererSetSharedState(NULL);
+        rendererRemoveAllBuffers();
+        log(DEBUG, "disconnected");
     }
 
     if ((conn_fd = fd) != -1) {
@@ -223,7 +230,7 @@ static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd) {
     }
 }
 
-static jboolean connected(JNIEnv* env, jclass clazz) {
+static jboolean connected(__unused JNIEnv* env,__unused jclass clazz) {
     return conn_fd != -1;
 }
 
@@ -360,7 +367,7 @@ static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
     }
 }
 
-static void surfaceChanged(JNIEnv *env, jobject thiz, jobject sfc) {
+static void surfaceChanged(JNIEnv *env, __unused jobject thiz, jobject sfc) {
     ANativeWindow* win = sfc ? ANativeWindow_fromSurface(env, sfc) : NULL;
     if (win)
         ANativeWindow_acquire(win);
@@ -368,7 +375,7 @@ static void surfaceChanged(JNIEnv *env, jobject thiz, jobject sfc) {
     rendererSetWindow(win);
 }
 
-JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
     JNIEnv* env;
     static JNINativeMethod methods[] = {
             {"nativeInit", "()V", (void *)&nativeInit},

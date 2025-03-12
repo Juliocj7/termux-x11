@@ -18,7 +18,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
-#include "os.h"
+#include "list.h"
 #include "lorie.h"
 
 #define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
@@ -113,17 +113,17 @@ static EGLContext ctx = EGL_NO_CONTEXT;
 static EGLSurface defaultSfc = EGL_NO_SURFACE, sfc = EGL_NO_SURFACE;
 static EGLConfig cfg = 0;
 static ANativeWindow *defaultWin = NULL, *win = NULL;
-static LorieBuffer *buffer = NULL;
+static volatile struct xorg_list addedBuffers, buffers, removedBuffers;
 
 static JNIEnv* renderEnv = NULL;
-static volatile bool stateChanged = false, bufferChanged = false, windowChanged = false;
+static volatile bool stateChanged = false, windowChanged = false;
 static volatile struct lorie_shared_server_state* pendingState = NULL;
-static volatile LorieBuffer* pendingBuffer = NULL;
 static volatile ANativeWindow* pendingWin = NULL;
 
 static pthread_mutex_t stateLock;
 static pthread_cond_t stateCond;
 static pthread_cond_t stateChangeFinishCond;
+static pthread_spinlock_t bufferLock;
 static volatile struct lorie_shared_server_state* state = NULL;
 static struct {
     GLuint id;
@@ -133,7 +133,11 @@ static struct {
 GLuint g_texture_program = 0, gv_pos = 0, gv_coords = 0;
 GLuint g_texture_program_bgra = 0, gv_pos_bgra = 0, gv_coords_bgra = 0;
 
-static void* rendererThread(JNIEnv* env);
+static void* rendererThread(void);
+
+static void pthreadCondVarProxyInit(void);
+static void* pthreadCondVarProxyThread(void* cookie);
+static void pthreadCondVarProxyListenOtherCondVar(pthread_cond_t* var);
 
 static inline __always_inline void bindLinearTexture(GLuint id) {
     glBindTexture(GL_TEXTURE_2D, id);
@@ -162,6 +166,12 @@ int rendererInitThread(JavaVM *vm) {
     EGLint major, minor;
     EGLint numConfigs;
     EGLint *const alphaAttrib = &configAttribs[11];
+
+    pthread_setname_np(pthread_self(), "LorieRendererThread");
+
+    xorg_list_init(&addedBuffers);
+    xorg_list_init(&buffers);
+    xorg_list_init(&removedBuffers);
 
     (*vm)->AttachCurrentThread(vm, &env, NULL);
 
@@ -225,25 +235,27 @@ int rendererInitThread(JavaVM *vm) {
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &cursor.id);
 
-    rendererThread(env);
+    rendererThread();
     return 1;
 }
 
-int rendererInit(JNIEnv* env) {
+void rendererInit(JNIEnv* env) {
     pthread_t t;
     JavaVM *vm;
 
     if (ctx)
-        return 1;
+        return;
 
     (*env)->GetJavaVM(env, &vm);
+
+    pthreadCondVarProxyInit();
 
     pthread_mutex_init(&stateLock, NULL);
     pthread_cond_init(&stateCond, NULL);
     pthread_cond_init(&stateChangeFinishCond, NULL);
+    pthread_spin_init(&bufferLock, false);
 
     pthread_create(&t, NULL, (void*(*)(void*)) rendererInitThread, vm);
-    return 1;
 }
 
 void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
@@ -358,40 +370,54 @@ void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
 
 __unused void rendererSetSharedState(struct lorie_shared_server_state* newState) {
     pthread_mutex_lock(&stateLock);
-    if (newState == pendingState || newState == state)
-        goto end;
-
-    if (pendingState)
-        munmap(pendingState, sizeof(*state));
-
     pendingState = newState;
     stateChanged = true;
-
-    // We are not sure which conditional variable is used at current moment so let's signal both
-    if (state)
-        pthread_cond_signal(&state->cond);
     pthread_cond_signal(&stateCond);
 
-    end: pthread_mutex_unlock(&stateLock);
-}
-
-void rendererSetBuffer(LorieBuffer* buf) {
-    pthread_mutex_lock(&stateLock);
-    pendingBuffer = buf;
-    bufferChanged = true;
-
-    if (pendingBuffer)
-        LorieBuffer_acquire(pendingBuffer);
-
-    // We are not sure which conditional variable is used at current moment so let's signal both
-    if (state)
-        pthread_cond_signal(&state->cond);
-    pthread_cond_signal(&stateCond);
-
-    while(bufferChanged)
+    while(stateChanged)
         pthread_cond_wait(&stateChangeFinishCond, &stateLock);
 
     pthread_mutex_unlock(&stateLock);
+}
+
+void rendererAddBuffer(LorieBuffer* buf) {
+    pthread_spin_lock(&bufferLock);
+    LorieBuffer_addToList(buf, &addedBuffers);
+    pthread_cond_signal(&stateCond);
+    pthread_spin_unlock(&bufferLock);
+}
+
+void rendererRemoveBuffer(uint64_t id) {
+    pthread_spin_lock(&bufferLock);
+    LorieBuffer* buf = LorieBufferList_findById(&addedBuffers, id);
+    if (buf)
+        // Buffer was not attached to GL yet, it is safe to release it now.
+        LorieBuffer_release(buf);
+    else {
+        buf = LorieBufferList_findById(&buffers, id);
+        if (buf) {
+            // The buffer is attached to GL so we should release it from renderer thread.
+            LorieBuffer_removeFromList(buf);
+            LorieBuffer_addToList(buf, &removedBuffers);
+        }
+    }
+    pthread_spin_unlock(&bufferLock);
+}
+
+void rendererRemoveAllBuffers(void) {
+    LorieBuffer *buf = NULL;
+
+    pthread_spin_lock(&bufferLock);
+    while ((buf = LorieBufferList_first(&addedBuffers))) {
+        // These buffers are not yet attached to GL, it is safe to release them
+        LorieBuffer_release(buf);
+    }
+    while ((buf = LorieBufferList_first(&buffers))) {
+        // These buffers are attached to GL, we must release them from renderer thread.
+        LorieBuffer_removeFromList(buf);
+        LorieBuffer_addToList(buf, &removedBuffers);
+    }
+    pthread_spin_unlock(&bufferLock);
 }
 
 void rendererSetWindow(ANativeWindow* newWin) {
@@ -408,9 +434,6 @@ void rendererSetWindow(ANativeWindow* newWin) {
     pendingWin = newWin;
     windowChanged = TRUE;
 
-    // We are not sure which conditional variable is used at current moment so let's signal both
-    if (state)
-        pthread_cond_signal(&state->cond);
     pthread_cond_signal(&stateCond);
 
     // We should wait until renderer destroys EGLSurface before SurfaceCallback::surfaceDestroyed finishes
@@ -424,7 +447,7 @@ void rendererSetWindow(ANativeWindow* newWin) {
     pthread_mutex_unlock(&stateLock);
 }
 
-static inline __always_inline void releaseWinAndSurface(JNIEnv *env, ANativeWindow** anw, EGLSurface *esfc) {
+static inline __always_inline void releaseWinAndSurface(ANativeWindow** anw, EGLSurface *esfc) {
     if (esfc && *esfc && *esfc != defaultSfc) {
         // Requeue the dequeued buffer, causes flickering during window reconfiguring
         eglSwapBuffers(egl_display, *esfc);
@@ -441,16 +464,16 @@ static inline __always_inline void releaseWinAndSurface(JNIEnv *env, ANativeWind
     }
 }
 
-void rendererRefreshContext(JNIEnv* env) {
+void rendererRefreshContext(void) {
     int width = pendingWin ? ANativeWindow_getWidth(pendingWin) : 0;
     int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
     log("rendererSetWindow %p %d %d", pendingWin, width, height);
 
-    releaseWinAndSurface(env, &win, &sfc);
+    releaseWinAndSurface(&win, &sfc);
 
     if (pendingWin && (width <= 0 || height <= 0)) {
         log("Xlorie: We've got invalid surface. Probably it became invalid before we started working with it.\n");
-        releaseWinAndSurface(env, &pendingWin, NULL);
+        releaseWinAndSurface(&pendingWin, NULL);
     }
 
     win = pendingWin;
@@ -485,35 +508,36 @@ void rendererRefreshContext(JNIEnv* env) {
     log("Xlorie: new surface applied: %p\n", sfc);
 }
 
-static void draw(GLuint id, float x0, float y0, float x1, float y1, uint8_t flip);
+static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
 static void drawCursor(float displayWidth, float displayHeight);
 
-static void rendererRenewImage(void) {
-    const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
-    if (buffer)
-        LorieBuffer_release(buffer);
-
-    buffer = pendingBuffer;
-    pendingBuffer = NULL;
-    bufferChanged = false;
-
-    LorieBuffer_attachToGL(buffer);
-    log("renderer: buffer changed %p %d %d", buffer, (int) LorieBuffer_getWidth(buffer), (int) LorieBuffer_getHeight(buffer));
-
-    // We should redraw image at least once right after buffer change
-    if (state)
-        state->surfaceAvailable = state->drawRequested = state->cursor.updated = win != defaultWin;
-}
-
-void rendererRedrawLocked(JNIEnv* env) {
+void rendererRedrawLocked(bool* waitingForBuffers) {
+    float xfactor = 1.f;
+    LorieBuffer_Desc *desc = NULL;
     EGLSync fence;
+    // The buffer will not be released until this function ends, but main thread can modify buffer list
+    pthread_spin_lock(&bufferLock);
+    LorieBuffer *buffer = LorieBufferList_findById(&buffers, state->rootWindowTextureID);
+    // Probably X server requested us to draw removed buffer and immediately requested to remove it. Let's display it one last time.
+    if (!buffer)
+        buffer = LorieBufferList_findById(&removedBuffers, state->rootWindowTextureID);
+    pthread_spin_unlock(&bufferLock);
+    if (!buffer) {
+        log("Buffer %llu not found", state->rootWindowTextureID);
+        *waitingForBuffers = true;
+        return;
+    }
+
+    desc = LorieBuffer_description(buffer);
 
     // We should signal X server to not use root window while we actively copy it
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     state->drawRequested = FALSE;
 
     LorieBuffer_bindTexture(buffer);
-    draw(0,  -1.f, -1.f, 1.f, 1.f, LorieBuffer_isRgba(buffer));
+    if (desc->type == LORIEBUFFER_FD)
+        xfactor = (float) desc->width/(float) desc->stride;
+    draw(0, -1.f, -1.f, 1.f, 1.f, xfactor, LorieBuffer_isRgba(buffer));
     fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
     glFlush();
 
@@ -552,12 +576,16 @@ void rendererRedrawLocked(JNIEnv* env) {
     state->renderedFrames++;
 }
 
-static inline __always_inline bool rendererShouldWait(void) {
-    if (stateChanged || windowChanged || bufferChanged)
+static inline __always_inline bool rendererShouldWait(const bool *waitingForBuffers) {
+    bool buffersChanged;
+    pthread_spin_lock(&bufferLock);
+    buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
+    pthread_spin_unlock(&bufferLock);
+    if (stateChanged || windowChanged || buffersChanged)
         // If there are pending changes we should process them immediately.
         return false;
 
-    if (!state || !state->surfaceAvailable || state->waitForNextFrame)
+    if (!state || !state->surfaceAvailable || state->waitForNextFrame || *waitingForBuffers)
         // Even in the case if there are pending changes, we can not draw it without rendering surface
         return true;
 
@@ -569,21 +597,17 @@ static inline __always_inline bool rendererShouldWait(void) {
     return true;
 }
 
-__noreturn static void* rendererThread(JNIEnv* env) {
-    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_init(&m, NULL);
-    // Mutex is needed only for pthread_cond_wait, it is needed only to make thread sleep when it is idle.
-    // We check for all event that may change in between so we should not miss any events.
-    pthread_mutex_lock(&m);
-
+__noreturn static void* rendererThread(void) {
+    LorieBuffer* buf;
+    bool waitingForBuffers = false;
     while (true) {
-        while (rendererShouldWait())
-            pthread_cond_wait(state ? &state->cond : &stateCond, &m);
+        while (rendererShouldWait(&waitingForBuffers))
+            pthread_cond_wait(&stateCond, &stateLock);
 
-        pthread_mutex_lock(&stateLock);
         if (stateChanged) {
+            struct lorie_shared_server_state* oldState = NULL;
             if (state && pendingState != state)
-                munmap(state, sizeof(*state));
+                oldState = state;
 
             state = pendingState;
             pendingState = NULL;
@@ -596,19 +620,36 @@ __noreturn static void* rendererThread(JNIEnv* env) {
                 glClear(GL_COLOR_BUFFER_BIT);
                 eglSwapBuffers(egl_display, sfc);
             }
+
+            pthreadCondVarProxyListenOtherCondVar(state ? &state->cond : NULL);
+
+            if (oldState)
+                munmap(oldState, sizeof(*oldState));
         }
 
         if (windowChanged)
-            rendererRefreshContext(env);
+            rendererRefreshContext();
 
-        if (bufferChanged)
-            rendererRenewImage();
+        // Attach all pending buffers to GL.
+        while((buf = LorieBufferList_first(&addedBuffers))) {
+            LorieBuffer_attachToGL(buf);
+            LorieBuffer_removeFromList(buf); // remove from addedBuffers
+            LorieBuffer_addToList(buf, &buffers);
+            waitingForBuffers = false;
+        }
 
         pthread_cond_signal(&stateChangeFinishCond);
         pthread_mutex_unlock(&stateLock);
 
         if (state && state->surfaceAvailable && !state->waitForNextFrame && (state->drawRequested || state->cursor.moved || state->cursor.updated))
-            rendererRedrawLocked(env);
+            rendererRedrawLocked(&waitingForBuffers);
+
+        pthread_spin_lock(&bufferLock);
+        // Remove all buffers which were attached to GL.
+        while((buf = LorieBufferList_first(&removedBuffers)))
+            LorieBuffer_release(buf);
+        pthread_spin_unlock(&bufferLock);
+        pthread_mutex_lock(&stateLock);
     }
 }
 
@@ -666,12 +707,12 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
     return 0;
 }
 
-static void draw(GLuint id, float x0, float y0, float x1, float y1, uint8_t flip) {
+static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip) {
     float coords[16] = {
         x0, -y0, 0.f, 0.f,
-        x1, -y0, 1.f, 0.f,
+        x1, -y0, xfactor, 0.f,
         x0, -y1, 0.f, 1.f,
-        x1, -y1, 1.f, 1.f,
+        x1, -y1, xfactor, 1.f,
     };
 
     GLuint p = flip ? gv_pos_bgra : gv_pos, c = flip ? gv_coords_bgra : gv_coords;
@@ -700,6 +741,48 @@ __unused static void drawCursor(float displayWidth, float displayHeight) {
     h = 2.f * (float) state->cursor.height / displayHeight;
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    draw(cursor.id, x, y, x + w, y + h, false);
+    draw(cursor.id, x, y, x + w, y + h, 1.f, false);
     glDisable(GL_BLEND);
+}
+
+// auxillary pthread condition var proxy shenanigans
+static volatile struct {
+    pthread_mutex_t lock;
+    pthread_cond_t def, *current, *pending;
+    bool relocked;
+} proxy = { .current = &proxy.def };
+
+static void pthreadCondVarProxyInit(void) {
+    pthread_t t;
+    pthread_mutex_init(&proxy.lock, NULL);
+    pthread_cond_init(&proxy.def, NULL);
+    pthread_create(&t, NULL, pthreadCondVarProxyThread, NULL);
+}
+
+__noreturn static void* pthreadCondVarProxyThread(void* cookie) {
+    // We can not wait for two conditional variables simultaneously.
+    // But we are required to listen for both remote and local events.
+    // This thread waits for remote signals and proxies them to the local cond var.
+    pthread_setname_np(pthread_self(), "PthreadCondVarProxy");
+    pthread_mutex_lock(&proxy.lock);
+    log("pthreadCondVarProxyThread %ld started", pthread_self());
+    while (true) {
+        pthread_cond_wait(proxy.current, &proxy.lock);
+        if (proxy.pending) {
+            proxy.current = proxy.pending;
+            proxy.pending = NULL;
+        }
+        proxy.relocked = true;
+        pthread_cond_signal(&stateCond);
+    }
+}
+
+static void pthreadCondVarProxyListenOtherCondVar(pthread_cond_t* var) {
+    pthread_mutex_lock(&proxy.lock);
+    pthread_cond_broadcast(proxy.current);
+    proxy.pending = var ?: &proxy.def;
+    proxy.relocked = false;
+    while(!proxy.relocked)
+        pthread_cond_wait(&stateCond, &proxy.lock);
+    pthread_mutex_unlock(&proxy.lock);
 }

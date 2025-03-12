@@ -12,13 +12,13 @@ Termux:X11 is a fully fledged X server. It is built with Android NDK and optimiz
 This repo uses submodules. Use 
 
 ```
-~ $ git clone --recurse-submodules https://github.com/termux/termux-x11 
+git clone --recurse-submodules https://github.com/termux/termux-x11 
 ```
 or
 ```
-~ $ git clone https://github.com/termux/termux-x11
-~ $ cd termux-x11
-~ $ git submodule update --init --recursive
+git clone https://github.com/termux/termux-x11
+cd termux-x11
+git submodule update --init --recursive
 ```
 
 ## How does it work?
@@ -36,18 +36,18 @@ Finally, most people will want to use a desktop environment with Termux:X11. If 
 ## Running Graphical Applications
 You can start your desired graphical application by doing:
 ```
-~ $ termux-x11 :1 -xstartup "dbus-launch --exit-with-session xfce4-session"
+termux-x11 :1 -xstartup "dbus-launch --exit-with-session xfce4-session"
 ```
 or
 ```
-~ $ termux-x11 :1 &
-~ $ env DISPLAY=:1 dbus-launch --exit-with-session xfce4-session
+termux-x11 :1 &
+env DISPLAY=:1 dbus-launch --exit-with-session xfce4-session
 ```
 You may replace `xfce4-session` if you use other than Xfce
 
 `dbus-launch` does not work for some users so you can start session with
 ```
-~ $ termux-x11 :1 -xstartup "xfce4-session"
+termux-x11 :1 -xstartup "xfce4-session"
 ```
 
 Also you can do 
@@ -63,38 +63,43 @@ But you should pay attention that `termux-x11` command is still running and can 
 
 For some reason some devices output only black screen with cursor instead of normal output so you should pass `-legacy-drawing` option.
 ```
-~ $ termux-x11 :1 -legacy-drawing -xstartup "xfce4-session"
+termux-x11 :1 -legacy-drawing -xstartup "xfce4-session"
 ```
 
 For some reason some devices show screen with swapped colours, in this case you should pass `-force-bgra` option.
 ```
-~ $ termux-x11 :1 -force-bgra -xstartup "xfce4-session"
+termux-x11 :1 -force-bgra -xstartup "xfce4-session"
 ```
 
 ## Using with proot environment
 If you plan to use the program with proot, keep in mind that you need to launch proot/proot-distro with the --shared-tmp option. 
+
 If passing this option is not possible, set the TMPDIR environment variable to point to the directory that corresponds to /tmp in the target container.
+
 If you are using proot-distro you should know that it is possible to start `termux-x11` command from inside proot container.
 
 ## Using with chroot environment
-If you plan to use the program with chroot or unshare, you must to run it as root and set the TMPDIR environment variable to point to the directory that corresponds to /tmp in the target container. 
+If you plan to use the program with chroot or unshare, you must to run it as root and set the TMPDIR environment variable to point to the directory that corresponds to /tmp in the target container.
+
 This directory must be accessible from the shell from which you launch termux-x11, i.e. it must be in the same SELinux context, same mount namespace, and so on.
+
 Also you must set `XKB_CONFIG_ROOT` environment variable pointing to container's `/usr/share/X11/xkb` directory, otherwise you will have `xkbcomp`-related errors.
+
 You can get loader for nightly build from an artifact of [last successful build](https://github.com/termux/termux-x11/actions/workflows/debug_build.yml)
+
 Do not forget to disable SELinux
 ```
 setenforce 0
 export TMPDIR=/path/to/chroot/container/tmp
 export CLASSPATH=$(/system/bin/pm path com.termux.x11 | cut -d: -f2)
-/system/bin/app_process / com.termux.x11.CmdEntryPoint :0
+/system/bin/app_process / --nice-name=termux-x11 com.termux.x11.CmdEntryPoint :0
 ```
 
 ### Force stopping X server (running in termux background, not an activity)
 
-termux-x11's X server runs in process with name "app_process", not "termux-x11". But you can kill it by searching "com.termux.x11" in commandline.
-So killing it will look like
+termux-x11's X server runs in process with name "termux-x11". You can kill it by
 ```
-pkill -f com.termux.x11
+pkill termux-x11
 ```
 
 ### Closing Android activity (running in foreground, not X server)
@@ -174,7 +179,7 @@ You can fix this in your window manager settings (in the case of xfce4 and lxqt 
 
 Also you can start `termux-x11` with `-dpi` option.
 ```
-~ $ termux-x11 :1 -xstartup "xfce4-session" -dpi 120
+termux-x11 :1 -xstartup "xfce4-session" -dpi 120
 ```
 
 ## Changing, dumping and restoring preferences from commandline
@@ -185,7 +190,7 @@ It is possible to change preferences of termux-x11 from command line.
 termux-x11-preference [list] {key:value} [{key2:value2}]..."
 ```
 
-Use `termux-x11-preference` to dump current preference.
+Use `termux-x11-preference list` to dump current preferences.
 Use `termux-x11-preference list > file` to dump current preferences to file.
 Use `termux-x11-preferences < file` to restore preferences from file.
 Use `termux-x11-preferences "fullscreen"="false" "showAdditionalKbd"="true"` to disable fullscreen and enable additional key bar. The full list of preferences you can modify is available with `termux-x11-preference list` command. You can specify one or more preferences here.

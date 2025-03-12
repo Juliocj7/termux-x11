@@ -20,7 +20,6 @@
 
 struct lorie_shared_server_state;
 
-void lorieSetVM(JavaVM* vm);
 void lorieConfigureNotify(int width, int height, int framerate, size_t name_size, char* name);
 void lorieEnableClipboardSync(Bool enable);
 void lorieSendClipboardData(const char* data);
@@ -29,18 +28,21 @@ void lorieRequestClipboard(void);
 void lorieHandleClipboardAnnounce(void);
 void lorieHandleClipboardData(const char* data);
 void lorieSetStylusEnabled(Bool enabled);
-void lorieTriggerWorkingQueue(void);
+void lorieWakeServer(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
-void lorieSendRootWindowBuffer(LorieBuffer* buffer);
+void lorieRegisterBuffer(LorieBuffer* buffer);
+void lorieUnregisterBuffer(LorieBuffer* buffer);
 bool lorieConnectionAlive(void);
 
-__unused int rendererInit(JNIEnv* env);
+__unused void rendererInit(JNIEnv* env);
 __unused void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip);
-__unused void rendererSetBuffer(LorieBuffer* buf);
 __unused void rendererSetWindow(ANativeWindow* newWin);
 __unused void rendererSetSharedState(struct lorie_shared_server_state* newState);
+__unused void rendererAddBuffer(LorieBuffer* buf);
+__unused void rendererRemoveBuffer(uint64_t id);
+__unused void rendererRemoveAllBuffers(void);
 
 static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {
     // Unfortunately there is no robust mutexes in bionic.
@@ -87,7 +89,8 @@ static inline __always_inline void lorie_mutex_unlock(pthread_mutex_t* mutex, pi
 typedef enum {
     EVENT_UNKNOWN __unused = 0,
     EVENT_SHARED_SERVER_STATE,
-    EVENT_SHARED_ROOT_WINDOW_BUFFER,
+    EVENT_ADD_BUFFER,
+    EVENT_REMOVE_BUFFER,
     EVENT_SCREEN_SIZE,
     EVENT_TOUCH,
     EVENT_MOUSE,
@@ -109,6 +112,10 @@ typedef union {
         size_t name_size;
         char *name;
     } screenSize;
+    struct {
+        uint8_t t;
+        unsigned long id;
+    } removeBuffer;
     struct {
         uint8_t t;
         uint16_t type, id, x, y;
@@ -162,6 +169,9 @@ struct lorie_shared_server_state {
      * Renderer thread sleeps when it is idle so we must explicitly wake it up.
      */
     pthread_cond_t cond; // initialized at X server side.
+
+    /* ID of root window texture to be drawn. */
+    uint64_t rootWindowTextureID;
 
     /* A signal to renderer to update root window texture content from shared fragment if needed */
     volatile uint8_t drawRequested;
